@@ -8,6 +8,10 @@ human-readable read of what the rover "sees".
 Input: a sweep, i.e. a list of (relative_angle_deg, distance_cm) tuples. A
 distance of -1 (or negative) means "no echo / out of range" and is treated as
 open space.
+
+WALLFOLLOW mode adds two extra labels:
+  WF_CORNER    - wall detected ahead during wall-following
+  WF_WALL_NEAR - rover is within TARGET_WALL_CM of the right wall
 """
 
 from __future__ import annotations
@@ -38,8 +42,13 @@ def _bucket(scan: Sequence[Tuple[int, float]]):
     )
 
 
-def classify(scan: Sequence[Tuple[int, float]]) -> str:
-    """Return a coarse scene label for a single sweep."""
+def classify(scan: Sequence[Tuple[int, float]], mode: str = "") -> str:
+    """Return a coarse scene label for a single sweep.
+
+    When *mode* is ``"WALLFOLLOW"`` two additional labels are possible:
+    ``WF_CORNER`` (wall ahead during wall-following) and ``WF_WALL_NEAR``
+    (right wall inside the follow band).
+    """
     if not scan:
         return "UNKNOWN"
 
@@ -48,6 +57,12 @@ def classify(scan: Sequence[Tuple[int, float]]) -> str:
     front_blocked = front < NEAR_CM
     left_blocked = left < NEAR_CM
     right_blocked = right < NEAR_CM
+
+    if mode.upper() == "WALLFOLLOW":
+        if front_blocked:
+            return "WF_CORNER"
+        if right_blocked:
+            return "WF_WALL_NEAR"
 
     if front_blocked and left_blocked and right_blocked:
         return "DEAD_END"

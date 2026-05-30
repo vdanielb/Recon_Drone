@@ -7,7 +7,8 @@
  *   - SG90 servo sweep that aims the ultrasonic sensor
  *   - HC-SR04 ultrasonic distance measurement
  *   - Pulse-based autonomous obstacle avoidance
- *   - Four operating modes: AUTO / MANUAL / SCAN_ONLY / STOP
+ *   - Right-hand wall-following perimeter scan (Roomba-style room mapping)
+ *   - Five operating modes: AUTO / MANUAL / SCAN_ONLY / WALLFOLLOW / STOP
  *   - CSV telemetry over Serial for the Linux/Python mapping side
  *
  * Telemetry line formats (one record per line, '\n' terminated):
@@ -16,7 +17,7 @@
  *   STATE,timestamp_ms,mode,message
  *
  * Single-character commands accepted on Serial (from laptop or Linux side):
- *   a = AUTO,  m = MANUAL,  o = SCAN_ONLY,  x = STOP
+ *   a = AUTO,  m = MANUAL,  o = SCAN_ONLY,  w = WALLFOLLOW,  x = STOP
  *   In MANUAL: w/s = forward/back, a/d... (see MANUAL handling below; uses i/k/j/l)
  *
  * =====================  CRITICAL ELECTRICAL WARNING  =======================
@@ -61,6 +62,19 @@ const int  OBSTACLE_THRESHOLD  = 30;   // cm; below this the front is "blocked"
 const unsigned long FORWARD_PULSE_MS = 300;  // step-based forward burst
 const unsigned long TURN_PULSE_MS    = 250;  // step-based turn burst
 
+// Wall-following tuning
+// TARGET_WALL_CM: desired gap between rover and the right wall.
+// WALL_TOLERANCE_CM: dead-band around the target; inside it we go straight.
+// WF_CORNER_THRESHOLD_CM: front distance that triggers a left turn (corner ahead).
+// WF_OPEN_THRESHOLD_CM: right-side distance that indicates the rover has drifted
+//   past a gap or corner and should turn right to re-acquire the wall.
+// WF_TURN90_MS: duration of a 90-degree in-place turn (calibrate on real hardware).
+const int  TARGET_WALL_CM        = 20;
+const int  WALL_TOLERANCE_CM     = 5;
+const int  WF_CORNER_THRESHOLD_CM = 25;
+const int  WF_OPEN_THRESHOLD_CM  = 50;
+const unsigned long WF_TURN90_MS = 700;  // tune so rover turns ~90 deg in place
+
 // Ultrasonic sensing limits
 const long MIN_VALID_CM = 3;     // ignore anything closer than this (noise)
 const long MAX_VALID_CM = 250;   // ignore anything farther than this
@@ -77,8 +91,13 @@ const int NUM_SCAN_ANGLES = sizeof(SCAN_ANGLES) / sizeof(SCAN_ANGLES[0]);
 // ---------------------------------------------------------------------------
 // Operating modes
 // ---------------------------------------------------------------------------
-enum Mode { MODE_AUTO, MODE_MANUAL, MODE_SCAN_ONLY, MODE_STOP };
+enum Mode { MODE_AUTO, MODE_MANUAL, MODE_SCAN_ONLY, MODE_WALLFOLLOW, MODE_STOP };
 Mode currentMode = MODE_STOP;  // start safe: motors off until told to run
+
+// Wall-follow acquisition flag: true once the rover has found and aligned to
+// its first wall.  Reset to false every time WALLFOLLOW mode is entered so the
+// rover always starts with a fresh "drive to wall" acquisition pass.
+bool wf_acquired = false;
 
 Servo scanServo;
 
@@ -92,12 +111,25 @@ long readDistanceCM();
 int  scanAtAngle(int angle);
 void scanAndReport();
 void autonomousStep();
+void wallFollowStep();
 void manualStep(char cmd);
 void handleCommand(char cmd);
 const char* modeName(Mode m);
 void sendScan(int angle, long distance);
 void sendMove(const char* action, unsigned long duration_ms, int speed);
 void sendState(const char* message);
+
+// Return the closest valid right-side reading (min of front-right and right).
+// Using two angles avoids false "open" reads at wall ends where only the
+// outer sensor sees past the end of a wall segment.
+long scanRightWall() {
+  long rSide  = scanAtAngle(75);
+  long rFront = scanAtAngle(45);
+  long best = MAX_VALID_CM;
+  if (rSide  >= 0 && rSide  < best) best = rSide;
+  if (rFront >= 0 && rFront < best) best = rFront;
+  return (best == MAX_VALID_CM) ? -1 : best;
+}
 
 // ===========================================================================
 // Setup
@@ -137,6 +169,10 @@ void loop() {
       autonomousStep();
       break;
 
+    case MODE_WALLFOLLOW:
+      wallFollowStep();
+      break;
+
     case MODE_SCAN_ONLY:
       stopCar();
       scanAndReport();
@@ -162,10 +198,11 @@ void loop() {
 // ===========================================================================
 void handleCommand(char cmd) {
   switch (cmd) {
-    case 'a': currentMode = MODE_AUTO;      stopCar(); sendState("mode_auto");      break;
-    case 'm': currentMode = MODE_MANUAL;    stopCar(); sendState("mode_manual");    break;
-    case 'o': currentMode = MODE_SCAN_ONLY; stopCar(); sendState("mode_scan_only"); break;
-    case 'x': currentMode = MODE_STOP;      stopCar(); sendState("mode_stop");      break;
+    case 'a': currentMode = MODE_AUTO;       stopCar(); sendState("mode_auto");       break;
+    case 'm': currentMode = MODE_MANUAL;     stopCar(); sendState("mode_manual");     break;
+    case 'o': currentMode = MODE_SCAN_ONLY;  stopCar(); sendState("mode_scan_only");  break;
+    case 'w': currentMode = MODE_WALLFOLLOW; wf_acquired = false; stopCar(); sendState("mode_wallfollow"); break;
+    case 'x': currentMode = MODE_STOP;       stopCar(); sendState("mode_stop");       break;
     default:
       if (currentMode == MODE_MANUAL) {
         manualStep(cmd);
@@ -249,6 +286,118 @@ void autonomousStep() {
   }
 
   // After acting, do a full sweep so the map gets a fresh frame.
+  scanAndReport();
+}
+
+// ===========================================================================
+// Wall-following perimeter scan (right-hand rule)
+// ---------------------------------------------------------------------------
+// Phase 1 – Acquisition (wf_acquired == false):
+//   Drive straight forward until a wall is within WF_CORNER_THRESHOLD_CM,
+//   then turn left 90 deg so that wall ends up on the right side.
+//
+// Phase 2 – Following (wf_acquired == true):
+//   1. CORNER  - front too close  -> turn left 90 deg in place.
+//   2. OPEN    - right wall lost  -> forward burst + turn right 90 deg.
+//      (right distance uses min of 45 deg and 75 deg scans so wall ends
+//       do not falsely read as open space)
+//   3. TOO FAR - drifting right   -> nudge right + forward.
+//   4. TOO CLOSE - too near wall  -> nudge left  + forward.
+//   5. ON TRACK               -> drive straight.
+//   After every action: full sweep to keep the map dense.
+//
+// Tune WF_TURN90_MS until the rover turns ~90 degrees in place.
+// ===========================================================================
+void wallFollowStep() {
+  long front = scanAtAngle(0);
+  long right  = scanRightWall();
+
+  // Treat sensor misses as "far away / open".
+  long frontDist = (front < 0) ? (long)MAX_VALID_CM : front;
+  long rightDist = (right < 0) ? (long)MAX_VALID_CM : right;
+
+  // ------------------------------------------------------------------
+  // Phase 1: acquisition – drive straight until we see a wall ahead.
+  // ------------------------------------------------------------------
+  if (!wf_acquired) {
+    if (frontDist <= WF_CORNER_THRESHOLD_CM) {
+      // Found a wall straight ahead. Turn left 90 deg so it becomes the
+      // right-side wall, then switch to following.
+      stopCar();
+      sendState("wf_acquired");
+      turnLeft(TURN_SPEED);
+      delay(WF_TURN90_MS);
+      stopCar();
+      sendMove("TURN_LEFT", WF_TURN90_MS, TURN_SPEED);
+      wf_acquired = true;
+    } else {
+      moveForward(BASE_SPEED);
+      delay(FORWARD_PULSE_MS);
+      stopCar();
+      sendMove("FORWARD", FORWARD_PULSE_MS, BASE_SPEED);
+    }
+    scanAndReport();
+    return;
+  }
+
+  // ------------------------------------------------------------------
+  // Phase 2: wall-following.
+  // ------------------------------------------------------------------
+  if (frontDist <= WF_CORNER_THRESHOLD_CM) {
+    // Wall or inner corner straight ahead -> turn left 90 deg.
+    stopCar();
+    sendState("wf_corner");
+    turnLeft(TURN_SPEED);
+    delay(WF_TURN90_MS);
+    stopCar();
+    sendMove("TURN_LEFT", WF_TURN90_MS, TURN_SPEED);
+
+  } else if (rightDist > WF_OPEN_THRESHOLD_CM) {
+    // Right side opened up (outer corner / gap).
+    // Overshoot slightly, then turn right to wrap around the corner.
+    moveForward(BASE_SPEED);
+    delay(FORWARD_PULSE_MS);
+    stopCar();
+    sendMove("FORWARD", FORWARD_PULSE_MS, BASE_SPEED);
+
+    turnRight(TURN_SPEED);
+    delay(WF_TURN90_MS);
+    stopCar();
+    sendMove("TURN_RIGHT", WF_TURN90_MS, TURN_SPEED);
+
+  } else if (rightDist > TARGET_WALL_CM + WALL_TOLERANCE_CM) {
+    // Drifting away from right wall -> gentle right correction.
+    turnRight(TURN_SPEED);
+    delay(TURN_PULSE_MS / 2);
+    stopCar();
+    sendMove("TURN_RIGHT", TURN_PULSE_MS / 2, TURN_SPEED);
+
+    moveForward(BASE_SPEED);
+    delay(FORWARD_PULSE_MS);
+    stopCar();
+    sendMove("FORWARD", FORWARD_PULSE_MS, BASE_SPEED);
+
+  } else if (rightDist < TARGET_WALL_CM - WALL_TOLERANCE_CM) {
+    // Too close to right wall -> gentle left correction.
+    turnLeft(TURN_SPEED);
+    delay(TURN_PULSE_MS / 2);
+    stopCar();
+    sendMove("TURN_LEFT", TURN_PULSE_MS / 2, TURN_SPEED);
+
+    moveForward(BASE_SPEED);
+    delay(FORWARD_PULSE_MS);
+    stopCar();
+    sendMove("FORWARD", FORWARD_PULSE_MS, BASE_SPEED);
+
+  } else {
+    // Right wall in target band -> drive straight.
+    moveForward(BASE_SPEED);
+    delay(FORWARD_PULSE_MS);
+    stopCar();
+    sendMove("FORWARD", FORWARD_PULSE_MS, BASE_SPEED);
+  }
+
+  // Full sweep after every action to densely populate the map.
   scanAndReport();
 }
 
@@ -362,11 +511,12 @@ void stopCar() {
 // ===========================================================================
 const char* modeName(Mode m) {
   switch (m) {
-    case MODE_AUTO:      return "AUTO";
-    case MODE_MANUAL:    return "MANUAL";
-    case MODE_SCAN_ONLY: return "SCAN_ONLY";
-    case MODE_STOP:      return "STOP";
-    default:             return "UNKNOWN";
+    case MODE_AUTO:       return "AUTO";
+    case MODE_MANUAL:     return "MANUAL";
+    case MODE_SCAN_ONLY:  return "SCAN_ONLY";
+    case MODE_WALLFOLLOW: return "WALLFOLLOW";
+    case MODE_STOP:       return "STOP";
+    default:              return "UNKNOWN";
   }
 }
 

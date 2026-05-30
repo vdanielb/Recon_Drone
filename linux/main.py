@@ -98,13 +98,15 @@ def run(args: argparse.Namespace) -> int:
     scan_since_classify = 0
     sweeps_since_png = 0
 
-    print(f"[main] DARKMAP-Q offline mapper - source={args.source}")
+    print(f"[main] DARKMAP-Q offline mapper - source={args.source}"
+          + (f"  room={args.room}" if args.room else ""))
     print(f"[main] session log -> {session_path}")
 
     log_fh = open(session_path, "w", encoding="utf-8")
     try:
         with make_source(args.source, port=args.port, file=args.file,
-                         sim_steps=args.sim_steps, delay=args.delay) as source:
+                         sim_steps=args.sim_steps, delay=args.delay,
+                         room=args.room) as source:
             for line in source.lines():
                 if not line:
                     continue
@@ -131,7 +133,7 @@ def run(args: argparse.Namespace) -> int:
                     if scan_since_classify >= 7:
                         scan_since_classify = 0
                         sweeps_since_png += 1
-                        label = classify(mapper.last_scan)
+                        label = classify(mapper.last_scan, mode=current_mode)
                         write_status(current_mode, label)
                         # Refresh the saved PNG occasionally (for the dashboard).
                         # Rendering is relatively expensive, so throttle it.
@@ -179,8 +181,9 @@ def run(args: argparse.Namespace) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="DARKMAP-Q offline mapping app")
     p.add_argument("--source", default="sim",
-                   choices=["serial", "file", "stdin", "sim"],
-                   help="telemetry source (default: sim)")
+                   choices=["serial", "file", "stdin", "sim", "wallsim"],
+                   help="telemetry source (default: sim); "
+                        "use 'wallsim' to simulate the WALLFOLLOW mode")
     p.add_argument("--port", default=None,
                    help="serial port (e.g. /dev/ttyACM0); auto-detect if omitted")
     p.add_argument("--file", default=None,
@@ -199,6 +202,19 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="delay between sim/file lines in seconds (default: 0.03)")
     p.add_argument("--log-dir", default=None,
                    help="override the log directory (default: data/logs)")
+    p.add_argument("--room", default=None,
+                   help=(
+                       "room shape for --source wallsim. "
+                       "Formats: "
+                       "square (300cm default), "
+                       "square:N, "
+                       "rect:WxH (e.g. rect:500x300), "
+                       "circle, circle:N, circle:N:S (diameter cm, segments), "
+                       "triangle, triangle:N (equilateral side cm), "
+                       "l-shape, "
+                       "poly:x1,y1,x2,y2,... (custom polygon vertices in cm). "
+                       "Default: square"
+                   ))
     return p
 
 
