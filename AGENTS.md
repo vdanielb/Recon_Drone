@@ -3,6 +3,8 @@
 Offline GPS-denied reconnaissance mapping rover using the **Arduino UNO Q**.
 Read this file before making any changes to the codebase.
 
+Note that the UNO Q is very different from a normal UNO. Read about the Arduino UNO Q specifications in this link: @https://docs.arduino.cc/tutorials/uno-q/user-manual/#overview
+
 ---
 
 ## Project Overview
