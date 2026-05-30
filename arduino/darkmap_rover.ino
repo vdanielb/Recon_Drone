@@ -41,17 +41,18 @@
 #include <Servo.h>
 
 // ---------------------------------------------------------------------------
-// Pin configuration  (VERIFY against your motor driver + UNO Q carrier wiring)
-// Motor driver control pins are PWM-capable outputs. Adjust as needed.
+// Pin configuration — Elegoo V4 / TB6612 motor shield
 // ---------------------------------------------------------------------------
-#define LEFT_MOTOR_FWD    5   // PWM
-#define LEFT_MOTOR_REV    6   // PWM
-#define RIGHT_MOTOR_FWD   9   // PWM
-#define RIGHT_MOTOR_REV   10  // PWM
+// Motor driver (TB6612)
+#define PWMA   5   // left motor speed  (PWM)
+#define PWMB   6   // right motor speed (PWM)
+#define AIN1   7   // left motor direction
+#define BIN1   8   // right motor direction
+#define STBY   3   // TB6612 standby — HIGH to enable the driver
 
-#define SERVO_PIN         11  // PWM output to servo signal (avoid D3 for inputs)
-#define ULTRASONIC_TRIG   7   // output, 3.3V trigger is accepted by HC-SR04
-#define ULTRASONIC_ECHO   8   // input, MUST go through a voltage divider/level shifter
+#define SERVO_PIN         11  // PWM output to servo signal
+#define ULTRASONIC_TRIG   12  // HC-SR04 trigger (moved off AIN1/BIN1)
+#define ULTRASONIC_ECHO   4   // HC-SR04 echo — MUST go through voltage divider
 
 // ---------------------------------------------------------------------------
 // Tunable behavior constants  (start slow for clean mapping + safety)
@@ -137,10 +138,12 @@ long scanRightWall() {
 void setup() {
   Serial.begin(115200);
 
-  pinMode(LEFT_MOTOR_FWD, OUTPUT);
-  pinMode(LEFT_MOTOR_REV, OUTPUT);
-  pinMode(RIGHT_MOTOR_FWD, OUTPUT);
-  pinMode(RIGHT_MOTOR_REV, OUTPUT);
+  pinMode(PWMA,  OUTPUT);
+  pinMode(PWMB,  OUTPUT);
+  pinMode(AIN1,  OUTPUT);
+  pinMode(BIN1,  OUTPUT);
+  pinMode(STBY,  OUTPUT);
+  digitalWrite(STBY, HIGH);   // wake the TB6612 driver
 
   pinMode(ULTRASONIC_TRIG, OUTPUT);
   pinMode(ULTRASONIC_ECHO, INPUT);
@@ -470,40 +473,38 @@ long readDistanceCM() {
 //   Differential drive: left + right wheel direction sets motion.
 // ===========================================================================
 void moveForward(int speed) {
-  analogWrite(LEFT_MOTOR_FWD, speed);
-  analogWrite(LEFT_MOTOR_REV, 0);
-  analogWrite(RIGHT_MOTOR_FWD, speed);
-  analogWrite(RIGHT_MOTOR_REV, 0);
+  digitalWrite(AIN1, HIGH);   // left  → forward
+  digitalWrite(BIN1, HIGH);   // right → forward
+  analogWrite(PWMA, speed);
+  analogWrite(PWMB, speed);
 }
 
 void moveBackward(int speed) {
-  analogWrite(LEFT_MOTOR_FWD, 0);
-  analogWrite(LEFT_MOTOR_REV, speed);
-  analogWrite(RIGHT_MOTOR_FWD, 0);
-  analogWrite(RIGHT_MOTOR_REV, speed);
+  digitalWrite(AIN1, LOW);    // left  → reverse
+  digitalWrite(BIN1, LOW);    // right → reverse
+  analogWrite(PWMA, speed);
+  analogWrite(PWMB, speed);
 }
 
 void turnLeft(int speed) {
-  // Left wheel reverse, right wheel forward -> rotate left in place.
-  analogWrite(LEFT_MOTOR_FWD, 0);
-  analogWrite(LEFT_MOTOR_REV, speed);
-  analogWrite(RIGHT_MOTOR_FWD, speed);
-  analogWrite(RIGHT_MOTOR_REV, 0);
+  // Left wheel reverse, right wheel forward → rotate left in place.
+  digitalWrite(AIN1, LOW);    // left  → reverse
+  digitalWrite(BIN1, HIGH);   // right → forward
+  analogWrite(PWMA, speed);
+  analogWrite(PWMB, speed);
 }
 
 void turnRight(int speed) {
-  // Left wheel forward, right wheel reverse -> rotate right in place.
-  analogWrite(LEFT_MOTOR_FWD, speed);
-  analogWrite(LEFT_MOTOR_REV, 0);
-  analogWrite(RIGHT_MOTOR_FWD, 0);
-  analogWrite(RIGHT_MOTOR_REV, speed);
+  // Left wheel forward, right wheel reverse → rotate right in place.
+  digitalWrite(AIN1, HIGH);   // left  → forward
+  digitalWrite(BIN1, LOW);    // right → reverse
+  analogWrite(PWMA, speed);
+  analogWrite(PWMB, speed);
 }
 
 void stopCar() {
-  analogWrite(LEFT_MOTOR_FWD, 0);
-  analogWrite(LEFT_MOTOR_REV, 0);
-  analogWrite(RIGHT_MOTOR_FWD, 0);
-  analogWrite(RIGHT_MOTOR_REV, 0);
+  analogWrite(PWMA, 0);
+  analogWrite(PWMB, 0);
 }
 
 // ===========================================================================
