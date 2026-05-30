@@ -25,11 +25,11 @@ The MCU sends one-line CSV packets over serial. The Python side parses them.
 arduino/darkmap_rover.ino    MCU sketch - motors, servo, HC-SR04, wall-following, telemetry
 linux/serial_bridge.py       Telemetry sources: serial / file / stdin / sim / wallsim
 linux/mapper.py              Pose dead-reckoning, scan→XY, matplotlib map, PNG/CSV export
-linux/main.py                Orchestrator: parse packets, log, map, scene labels
+linux/main.py                Orchestrator: parse packets, log, map, scene labels, status.json
 linux/scene.py               Rule-based scene classification (no ML)
 linux/dashboard.py           Optional Flask dashboard (localhost only, no cloud)
 linux/requirements.txt       Python deps: matplotlib, pyserial, Flask
-data/logs/                   Session CSVs, points CSV, map.png (all gitignored)
+data/logs/                   Session CSVs, points CSV, map.png, status.json (all gitignored)
 ```
 
 ---
@@ -68,7 +68,7 @@ The primary room-mapping mode. The rover:
 
 1. **Acquisition phase** — drives straight forward until a wall is within
    `WF_CORNER_THRESHOLD_CM`, then turns left 90° so the wall becomes the
-   right-side reference.
+   right-side reference. Emits `STATE,...,WALLFOLLOW,wf_acquired` on transition.
 2. **Following phase** — keeps the right wall at `TARGET_WALL_CM` using a
    five-case decision loop every step:
    - Front blocked → turn left 90° (inner corner)
@@ -80,6 +80,11 @@ The primary room-mapping mode. The rover:
 Right-wall distance uses `scanRightWall()` which takes the **minimum of the
 45° and 75° right-side readings**. This prevents false "wall lost" triggers
 at wall segment ends where the outer beam sees past the edge.
+
+`wf_acquired` is a global `bool` in the sketch, reset to `false` every time
+`WALLFOLLOW` mode is entered. It separates Phase 1 (acquisition) from Phase 2
+(following). The Python simulator mirrors this with an internal `_acquired` flag
+in `WallFollowSimSource`.
 
 ### Wall-following constants (all in `darkmap_rover.ino`)
 
@@ -112,7 +117,7 @@ at wall segment ends where the outer beam sees past the edge.
   invalid.
 - Serial is opened at 115200 baud. The Linux side must match.
 - `wf_acquired` is a global bool reset every time `WALLFOLLOW` mode is entered.
-  It tracks whether the rover has found its first wall.
+  It tracks whether the rover has found its first wall (Phase 1 vs Phase 2).
 
 ---
 
@@ -136,6 +141,66 @@ at wall segment ends where the outer beam sees past the edge.
   installed.
 - matplotlib uses the `Agg` backend for headless saves; interactive plotting
   uses `ion()`. Never call `plt.show(blocking=True)` inside the main loop.
+
+---
+
+## `status.json` — Live Dashboard Contract
+
+`main.py` writes `data/logs/status.json` on every SCAN (every 7 sweeps or on
+point add), MOVE, and STATE event. `dashboard.py` polls it at `/api/status`
+every 500 ms. Do not change field names without updating both sides.
+
+```json
+{
+  "mode":             "WALLFOLLOW",
+  "scene":            "LEFT_BLOCKED",
+  "risk":             "CLEAR",
+  "last_distance_cm": 42.0,
+  "front_distance_cm": 38.0,
+  "obstacles":        512,
+  "path_points":      195,
+  "pose":             [12.3, 45.6],
+  "theta_deg":        90.0,
+  "last_scan":        [[angle, dist], ...],
+  "last_action":      "FORWARD 300ms",
+  "events":           [{"ts": "22:05:01", "msg": "FORWARD 300ms"}, ...],
+  "updated":          "22:05:01",
+  "path":             [[x, y], ...],
+  "obstacle_xy":      [[x, y], ...]
+}
+```
+
+`events` is capped at 20 entries server-side. The dashboard accumulates all
+events client-side across polls (deduplicated by `ts|msg`, newest first).
+
+---
+
+## Dashboard (`dashboard.py`)
+
+Served locally at `http://127.0.0.1:8000` by default.
+
+```bash
+pip install Flask
+python3 dashboard.py                      # default host/port
+python3 dashboard.py --host 0.0.0.0 --port 8000
+```
+
+**Features:**
+- Sticky nav bar with mode badge and live-pulse indicator
+- Risk banner (CLEAR / MEDIUM / HIGH) with flashing animation on HIGH
+- Seven stat cards: Scene, Obstacles, Path pts, Pose, Heading, Last scan, Last move
+- **Live map canvas** — renders obstacle point cloud, rover path, and rover pose
+  (with heading arrow and glow halo). Persists the last good frame so the map
+  never goes blank between polls.
+- **Radar canvas** — polar ultrasonic sweep with range rings, cardinal labels,
+  and hit-dot glow
+- **Event log** — accumulates all events for the session, sorted newest-first,
+  fully scrollable; no cap on displayed entries
+
+**Canvas sizing fix:** `ensureCanvasSize()` tracks last pixel dimensions via
+`WeakMap` and only resets `canvas.width`/`canvas.height` when the CSS size
+actually changes. This prevents the canvas from being cleared on every 500 ms
+poll (the original blank-canvas bug).
 
 ---
 
@@ -190,6 +255,7 @@ python3 main.py --source file --file ../data/logs/session_XXXX.csv
 - A `data/logs/session_*.csv` with SCAN/MOVE/STATE lines
 - A `data/logs/points_*.csv` with obstacle + path points
 - A `data/logs/map.png` showing walls and a rover path that traces the perimeter
+- A `data/logs/status.json` with the final telemetry snapshot
 - No Python exceptions
 
 ---
@@ -217,11 +283,15 @@ look rotated or sheared even when navigation is correct.
 
 - **Telemetry format** — changing field positions breaks both the MCU and the
   parser simultaneously.
+- **`status.json` field names** — the dashboard JavaScript reads these directly.
 - **`SPEED_CM_PER_SEC` / `TURN_DEG_PER_SEC`** without a calibration note.
 - **Motor driver pins D5/D6/D9/D10** without checking the physical wiring first.
 - **`scanRightWall()`** logic — it uses min(45°, 75°) specifically to prevent
   false open-corner reads at wall segment ends. Do not reduce this to a single
   angle.
+- **`ensureCanvasSize()`** in `dashboard.py` — it intentionally avoids resetting
+  `canvas.width` on every poll to prevent the blank-canvas bug. Do not replace
+  it with a naive resize call.
 
 ---
 
