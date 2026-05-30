@@ -50,9 +50,9 @@
 #define BIN1   8   // right motor direction
 #define STBY   3   // TB6612 standby — HIGH to enable the driver
 
-#define SERVO_PIN         11  // PWM output to servo signal
-#define ULTRASONIC_TRIG   12  // HC-SR04 trigger (moved off AIN1/BIN1)
-#define ULTRASONIC_ECHO   4   // HC-SR04 echo — MUST go through voltage divider
+#define SERVO_PIN         10  // PWM output to servo signal
+#define ULTRASONIC_TRIG   13  // HC-SR04 trigger (moved off AIN1/BIN1)
+#define ULTRASONIC_ECHO   12   // HC-SR04 echo — MUST go through voltage divider
 
 // ---------------------------------------------------------------------------
 // Tunable behavior constants  (start slow for clean mapping + safety)
