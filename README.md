@@ -69,13 +69,15 @@ STATE,timestamp_ms,mode,message                 # mode: AUTO/MANUAL/SCAN_ONLY/ST
 ```text
 arduino/darkmap_rover.ino   MCU sketch (motors, servo, ultrasonic, autonomy, telemetry)
 linux/serial_bridge.py      Telemetry sources: serial / file / stdin / built-in simulator
-linux/mapper.py             Pose dead-reckoning, scan->XY, live map, PNG/CSV export
-linux/main.py               Orchestrator: parse packets, log, map, scene tag
+linux/mapper.py             Pose dead-reckoning, scan->XY, live map, detection tags, PNG/CSV export
+linux/main.py               Orchestrator: parse packets, log, map, scene tag, fuse detections
 linux/scene.py              Rule-based scene classification (edge logic)
+linux/detector.py           Camera + YOLO recon object detection (offline, optional)
+linux/test_detector.py      Standalone webcam/model test for the detector
 linux/dashboard.py          Optional offline Flask dashboard
 linux/requirements.txt      Python dependencies
 docs/                       wiring.md, demo_script.md, pitch.md
-data/logs/                  Session CSVs, points CSV, map.png (gitignored)
+data/logs/                  Session CSVs, points CSV, detections CSV, map.png (gitignored)
 ```
 
 ## Run the Arduino side
@@ -122,9 +124,69 @@ python3 main.py --source file --file ../data/logs/session_YYYYMMDD_HHMMSS.csv
 Each run writes to `data/logs/`:
 
 - `session_<timestamp>.csv` - raw telemetry log
-- `points_<timestamp>.csv` - path + obstacle point cloud
+- `points_<timestamp>.csv` - path + obstacle point cloud (+ detection rows)
+- `detections_<timestamp>.csv` - recon detections (only if any were seen)
 - `map.png` - rendered 2D map
-- `status.json` - latest mode/scene/distance (used by the dashboard)
+- `status.json` - latest mode/scene/distance/detections (used by the dashboard)
+
+## Reconnaissance object detection (YOLO)
+
+DARKMAP-Q fuses two sensing channels into one tagged recon map:
+
+- **Distance sensors** answer *where* something is (front ultrasonic reading).
+- **Camera + YOLO** answer *what* it is (object class).
+- The **mapper/dashboard** combine them into a tagged 2D reconnaissance map.
+
+Detection runs locally with OpenCV + Ultralytics YOLO (`yolov8n.pt`). It is
+**on by default** when a camera and the model are available, runs in a
+background thread so it never blocks navigation/mapping, and **degrades
+gracefully** — if the camera, model, or packages are missing the rest of the
+system runs normally.
+
+### Setup
+
+```bash
+cd linux
+pip install -r requirements.txt   # includes opencv-python + ultralytics
+```
+
+The first run downloads `yolov8n.pt` once (needs internet that one time).
+After that the cached model runs fully offline. No cloud APIs are used.
+
+### Test the camera + model alone
+
+```bash
+python3 test_detector.py           # print detections every frame
+python3 test_detector.py --show    # annotated preview window
+python3 test_detector.py --once    # single frame then exit
+python3 test_detector.py --camera 1 --model yolov8n.pt --conf 0.5
+```
+
+### Detection flags for `main.py`
+
+```bash
+python3 main.py --source serial --port /dev/ttyACM0          # detection auto-on
+python3 main.py --source sim --no-detect                     # disable detection
+python3 main.py --source serial --camera 1 --detect-conf 0.5 # tune camera/threshold
+python3 main.py --source serial --detect-cooldown 5          # secs between tags/category
+```
+
+### Mission categories
+
+Only these object classes are kept; everything else is ignored. Detections are
+tagged neutrally for reconnaissance review only — nothing is labeled a weapon,
+threat, or danger.
+
+| Category | Objects |
+|---|---|
+| human | person |
+| bag | backpack, suitcase, handbag |
+| electronics | cell phone, laptop |
+| environment | chair, bottle, table |
+
+Tags are placed on the map using the latest front ultrasonic distance along the
+rover heading. If no distance is available the tag is placed just ahead of the
+rover with `note=distance_unknown`.
 
 ### Optional offline dashboard
 
@@ -152,7 +214,10 @@ stalling servo directly from the UNO Q. Keep all grounds common. Details in
 - No wheel encoders, so the dead-reckoning pose drifts over time. Use short,
   slow runs; tune `SPEED_CM_PER_SEC` / `TURN_DEG_PER_SEC` in `mapper.py`.
 - Thin, soft, or sharply angled surfaces may be missed by ultrasonic.
-- A normal camera does not help in total darkness without IR illumination.
+- YOLO object detection needs visible light (or IR illumination); in total
+  darkness ultrasonic mapping still works but the camera tags will not.
+- Detection bearing is approximate (single forward camera); tags are placed at
+  the front ultrasonic distance along the heading, not triangulated.
 - This is a proof-of-concept, not military-grade autonomy.
 
 ## Future improvements

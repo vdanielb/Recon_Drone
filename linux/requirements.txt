@@ -9,3 +9,17 @@ pyserial>=3.5
 
 # Optional local offline dashboard (dashboard.py).
 Flask>=2.0
+
+# Optional recon object detection (detector.py + test_detector.py).
+# Camera + YOLO classify mission objects and tag them on the map/dashboard.
+# numpy is pulled in transitively by these.
+# NOTE: the first run downloads yolov8n.pt once (needs internet that one time);
+#       afterwards the cached model runs fully offline. Use --no-detect to skip.
+opencv-python>=4.8
+ultralytics>=8.0
+
+# Edge inference — ONNX Runtime replaces Ultralytics on the UNO Q.
+# Run linux/quantize.py once on a dev machine to export yolov8n_int8.onnx,
+# then deploy that file + onnxruntime to the board (no PyTorch needed on edge).
+onnx>=1.14
+onnxruntime>=1.16

@@ -27,6 +27,15 @@ from typing import List, Optional, Tuple
 SPEED_CM_PER_SEC = 12.0   # forward speed estimate
 TURN_DEG_PER_SEC = 90.0   # in-place turn rate estimate
 
+# Recon detection category -> marker color (shared concept with the dashboard).
+CATEGORY_COLORS = {
+    "human":       "#ff5470",
+    "bag":         "#f5a623",
+    "electronics": "#4ea8ff",
+    "environment": "#22d3a0",
+}
+DEFAULT_TAG_COLOR = "#c0c0c0"
+
 
 @dataclass
 class Pose:
@@ -47,6 +56,8 @@ class Mapper:
     path_points: List[Tuple[float, float]] = field(default_factory=list)
     last_distance_cm: Optional[float] = None
     last_scan: List[Tuple[int, float]] = field(default_factory=list)  # (angle, dist)
+    # Camera/YOLO recon tags: {x, y, category, label, conf, note}
+    detection_tags: List[dict] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         # Seed the path with the starting position.
@@ -100,16 +111,58 @@ class Mapper:
         self.obstacle_points.append((px, py))
         return True
 
+    # ----- detection tags (camera + YOLO) ----------------------------------
+    def add_detection_tag(self, category: str, label: str, conf: float,
+                          distance_cm: Optional[float],
+                          bearing_deg: float = 0.0,
+                          note: str = "") -> dict:
+        """Place a recon detection on the map.
+
+        WHERE comes from the latest front ultrasonic distance (passed in);
+        WHAT comes from the camera/YOLO classifier. If ``distance_cm`` is
+        valid, the tag is projected along the rover heading (plus the camera
+        bearing offset). Otherwise it is placed just ahead of the rover pose
+        and annotated note="distance_unknown".
+        """
+        valid = distance_cm is not None and distance_cm >= 0
+        world_angle = self.pose.theta + math.radians(bearing_deg)
+        if valid:
+            tx = self.pose.x + distance_cm * math.cos(world_angle)
+            ty = self.pose.y + distance_cm * math.sin(world_angle)
+        else:
+            # Small forward offset so the marker is not under the rover icon.
+            offset = 12.0
+            tx = self.pose.x + offset * math.cos(world_angle)
+            ty = self.pose.y + offset * math.sin(world_angle)
+            note = note or "distance_unknown"
+
+        tag = {
+            "x": round(tx, 1),
+            "y": round(ty, 1),
+            "category": category,
+            "label": label,
+            "conf": round(float(conf), 3),
+            "note": note,
+        }
+        self.detection_tags.append(tag)
+        return tag
+
     # ----- persistence -----------------------------------------------------
     def save_points_csv(self, path: str) -> None:
         _ensure_parent(path)
         with open(path, "w", newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            w.writerow(["type", "x_cm", "y_cm"])
+            # Extra trailing columns are blank for path/obstacle rows; this
+            # keeps the schema backward-compatible while carrying detections.
+            w.writerow(["type", "x_cm", "y_cm", "category", "label", "conf", "note"])
             for (x, y) in self.path_points:
-                w.writerow(["path", f"{x:.2f}", f"{y:.2f}"])
+                w.writerow(["path", f"{x:.2f}", f"{y:.2f}", "", "", "", ""])
             for (x, y) in self.obstacle_points:
-                w.writerow(["obstacle", f"{x:.2f}", f"{y:.2f}"])
+                w.writerow(["obstacle", f"{x:.2f}", f"{y:.2f}", "", "", "", ""])
+            for t in self.detection_tags:
+                w.writerow(["detection", f"{t['x']:.2f}", f"{t['y']:.2f}",
+                            t["category"], t["label"], f"{t['conf']:.3f}",
+                            t.get("note", "")])
 
     def save_map(self, path: str = "data/logs/map.png") -> Optional[str]:
         """Render the current map to a PNG (headless-safe)."""
@@ -137,6 +190,20 @@ class Mapper:
         if len(self.path_points) >= 2:
             pxs, pys = zip(*self.path_points)
             ax.plot(pxs, pys, "-", c="#0275d8", linewidth=1.5, label="path")
+        # Detection tags (camera + YOLO) drawn above obstacles.
+        seen_categories = set()
+        for t in self.detection_tags:
+            color = CATEGORY_COLORS.get(t["category"], DEFAULT_TAG_COLOR)
+            # Only label the legend once per category to keep it uncluttered.
+            lbl = t["category"] if t["category"] not in seen_categories else None
+            seen_categories.add(t["category"])
+            ax.scatter([t["x"]], [t["y"]], s=70, marker="D",
+                       facecolors="none", edgecolors=color, linewidths=1.8,
+                       zorder=5, label=lbl)
+            ax.annotate(t["label"], (t["x"], t["y"]),
+                        textcoords="offset points", xytext=(6, 4),
+                        fontsize=7, color=color, zorder=6)
+
         # Current rover pose marker + heading arrow.
         ax.plot(self.pose.x, self.pose.y, marker="o", markersize=9,
                 color="#5cb85c", label="rover")

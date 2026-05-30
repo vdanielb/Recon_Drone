@@ -96,6 +96,13 @@ PAGE = r"""<!doctype html>
       border-color: rgba(78,168,255,.25);
       color: var(--blue);
     }
+    .tag-detect {
+      background: rgba(245,166,35,.08);
+      border-color: rgba(245,166,35,.25);
+      color: var(--amber);
+      font-family: 'JetBrains Mono', monospace;
+    }
+    .tag-detect.off { color: var(--muted); border-color: var(--border2); background: transparent; }
     .pulse-dot {
       width: 7px; height: 7px; border-radius: 50%;
       background: var(--green);
@@ -229,6 +236,30 @@ PAGE = r"""<!doctype html>
     .ev-crit .ev-msg { color: var(--red); }
     .no-events { color: var(--muted); font-size: 12px; padding: 6px 0; }
 
+    /* ── DETECTIONS ──────────────────────────────────────────── */
+    .det-counts {
+      display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px;
+    }
+    .det-chip {
+      display: flex; align-items: center; gap: 5px;
+      padding: 3px 9px; border-radius: 999px;
+      font-size: 11px; font-weight: 600;
+      border: 1px solid var(--border2); background: var(--surface2);
+    }
+    .det-swatch { width: 8px; height: 8px; border-radius: 2px; transform: rotate(45deg); }
+    .det-list { max-height: 220px; overflow-y: auto; scrollbar-width: thin; }
+    .det-row {
+      display: flex; gap: 8px; align-items: baseline;
+      padding: 5px 0; border-bottom: 1px solid #0d1824;
+      font-size: 11.5px; font-family: 'JetBrains Mono', monospace;
+    }
+    .det-row:last-child { border-bottom: none; }
+    .det-ts { color: var(--muted); flex-shrink: 0; font-size: 10px; }
+    .det-label { font-weight: 600; }
+    .det-meta { color: var(--muted); margin-left: auto; flex-shrink: 0; }
+    .det-note { color: var(--amber); font-size: 10px; }
+    .no-det { color: var(--muted); font-size: 12px; padding: 6px 0; }
+
     /* ── RIGHT COLUMN ────────────────────────────────────────── */
     .right-col { display: flex; flex-direction: column; gap: 14px; }
 
@@ -249,6 +280,7 @@ PAGE = r"""<!doctype html>
 <nav>
   <span class="nav-logo">DARK<span>MAP</span>-Q</span>
   <div class="nav-sep"></div>
+  <span class="nav-tag tag-detect" id="hdrDetect">DETECT: --</span>
   <span class="nav-tag tag-offline"><span class="pulse-dot"></span>OFFLINE</span>
   <span class="nav-tag tag-mode" id="hdrMode">STOP</span>
 </nav>
@@ -320,6 +352,18 @@ PAGE = r"""<!doctype html>
         </div>
         <div class="radar-wrap">
           <canvas id="radarCanvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Detections -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Recon detections</span>
+          <span class="panel-sub" id="detFps">--</span>
+        </div>
+        <div class="det-counts" id="detCounts"></div>
+        <div class="det-list" id="detList">
+          <div class="no-det">No detections yet…</div>
         </div>
       </div>
 
@@ -405,10 +449,20 @@ const COLORS = {
   origin:   "rgba(78,168,255,.2)",
 };
 
+// Recon detection category -> color (matches mapper.py CATEGORY_COLORS).
+const CATEGORY_COLORS = {
+  human:       "#ff5470",
+  bag:         "#f5a623",
+  electronics: "#4ea8ff",
+  environment: "#22d3a0",
+};
+function catColor(cat) { return CATEGORY_COLORS[cat] || "#c0c0c0"; }
+
 function mapBounds(data) {
   const pts = [
     ...(data.obstacle_xy || []),
     ...(data.path || []),
+    ...((data.detection_tags || []).map(t => [t.x, t.y])),
   ];
   if (data.pose) pts.push(data.pose);
   if (!pts.length) return {minX:-80, maxX:80, minY:-80, maxY:80};
@@ -430,7 +484,8 @@ function drawMap(data) {
   // Keep the best frame we've ever received so the map never goes blank.
   const obs  = data.obstacle_xy || [];
   const path = data.path        || [];
-  if (obs.length > 0 || path.length >= 2) _lastMapData = data;
+  const tags = data.detection_tags || [];
+  if (obs.length > 0 || path.length >= 2 || tags.length > 0) _lastMapData = data;
   const d = _lastMapData || data;   // draw from cache if current frame is empty
 
   const cssW = canvas.getBoundingClientRect().width;
@@ -519,6 +574,25 @@ function drawMap(data) {
     ctx.lineTo(cx + al*Math.cos(thetaRad), cy - al*Math.sin(thetaRad));
     ctx.stroke();
   }
+
+  // Detection tags (camera + YOLO) — diamonds + labels, drawn on top.
+  const dTags = d.detection_tags || [];
+  dTags.forEach(t => {
+    const px = tx(t.x), py = ty(t.y);
+    const col = catColor(t.category);
+    const s = 6;
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(Math.PI / 4);
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-s, -s, 2*s, 2*s);
+    ctx.restore();
+    ctx.fillStyle = col;
+    ctx.font = "10px 'JetBrains Mono', monospace";
+    ctx.textAlign = "left";
+    ctx.fillText(t.label || t.category, px + 9, py + 3);
+  });
 
   // "Waiting" overlay only shown before the very first frame of real data.
   document.getElementById("mapNoData").style.display = _lastMapData ? "none" : "flex";
@@ -665,6 +739,56 @@ function renderEvents(events) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Detections — counts + recent list + detector status badge.
+// ─────────────────────────────────────────────────────────────────────────────
+function renderDetector(data) {
+  const det = data.detector || {};
+  const badge = document.getElementById("hdrDetect");
+  const fpsEl = document.getElementById("detFps");
+  if (det.enabled) {
+    badge.className = "nav-tag tag-detect";
+    badge.textContent = `DETECT: ON ${det.fps ? det.fps.toFixed(0)+"fps" : ""}`.trim();
+    fpsEl.textContent = det.fps ? det.fps.toFixed(1) + " fps" : "--";
+  } else {
+    badge.className = "nav-tag tag-detect off";
+    badge.textContent = "DETECT: OFF";
+    fpsEl.textContent = det.available === false ? "unavailable" : "off";
+  }
+}
+
+function renderDetections(data) {
+  const counts = data.detection_counts || {};
+  const recent = data.detections || [];
+
+  const countsEl = document.getElementById("detCounts");
+  const cats = Object.keys(counts);
+  countsEl.innerHTML = cats.length
+    ? cats.map(c =>
+        `<span class="det-chip">
+           <span class="det-swatch" style="background:${catColor(c)}"></span>
+           ${c} <span style="color:var(--muted)">${counts[c]}</span>
+         </span>`).join("")
+    : "";
+
+  const listEl = document.getElementById("detList");
+  if (!recent.length) {
+    listEl.innerHTML = '<div class="no-det">No detections yet…</div>';
+    return;
+  }
+  listEl.innerHTML = recent.map(d => {
+    const dist = (typeof d.distance_cm === "number" && d.distance_cm >= 0)
+      ? d.distance_cm.toFixed(0) + "cm"
+      : '<span class="det-note">dist?</span>';
+    const conf = typeof d.conf === "number" ? (d.conf*100).toFixed(0)+"%" : "--";
+    return `<div class="det-row">
+      <span class="det-ts">${d.ts || ""}</span>
+      <span class="det-label" style="color:${catColor(d.category)}">${d.label || d.category}</span>
+      <span class="det-meta">${conf} · ${dist}</span>
+    </div>`;
+  }).join("");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // UI update
 // ─────────────────────────────────────────────────────────────────────────────
 function updateUI(data) {
@@ -699,6 +823,8 @@ function updateUI(data) {
   drawMap(data);
   drawRadar(data.last_scan);
   renderEvents(data.events);
+  renderDetector(data);
+  renderDetections(data);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

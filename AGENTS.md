@@ -24,12 +24,14 @@ The MCU sends one-line CSV packets over serial. The Python side parses them.
 ```text
 arduino/darkmap_rover.ino    MCU sketch - motors, servo, HC-SR04, wall-following, telemetry
 linux/serial_bridge.py       Telemetry sources: serial / file / stdin / sim / wallsim
-linux/mapper.py              Pose dead-reckoning, scan→XY, matplotlib map, PNG/CSV export
-linux/main.py                Orchestrator: parse packets, log, map, scene labels, status.json
+linux/mapper.py              Pose dead-reckoning, scan→XY, matplotlib map, detection tags, PNG/CSV export
+linux/main.py                Orchestrator: parse packets, log, map, scene labels, fuse detections, status.json
 linux/scene.py               Rule-based scene classification (no ML)
+linux/detector.py            Camera + Ultralytics YOLO recon detection (offline, optional, background thread)
+linux/test_detector.py       Standalone webcam/model test for the detector
 linux/dashboard.py           Optional Flask dashboard (localhost only, no cloud)
-linux/requirements.txt       Python deps: matplotlib, pyserial, Flask
-data/logs/                   Session CSVs, points CSV, map.png, status.json (all gitignored)
+linux/requirements.txt       Python deps: matplotlib, pyserial, Flask, opencv-python, ultralytics
+data/logs/                   Session CSVs, points CSV, detections CSV, map.png, status.json (all gitignored)
 ```
 
 ---
@@ -166,12 +168,43 @@ every 500 ms. Do not change field names without updating both sides.
   "events":           [{"ts": "22:05:01", "msg": "FORWARD 300ms"}, ...],
   "updated":          "22:05:01",
   "path":             [[x, y], ...],
-  "obstacle_xy":      [[x, y], ...]
+  "obstacle_xy":      [[x, y], ...],
+
+  "detections":       [{"ts","category","label","conf","distance_cm","x","y","note"}, ...],
+  "detection_tags":   [{"x","y","category","label","conf","note"}, ...],
+  "detection_counts": {"human": 2, "bag": 1, ...},
+  "detector":         {"enabled": true, "available": true, "model": "yolov8n.pt", "camera": 0, "fps": 3.1, "error": null}
 }
 ```
 
 `events` is capped at 20 entries server-side. The dashboard accumulates all
 events client-side across polls (deduplicated by `ts|msg`, newest first).
+
+The `detection_*` and `detector` fields are **additive** — they are always
+written (empty/false when detection is off) and older consumers that ignore
+them keep working. `detection_tags` is capped at ~200 for the map.
+
+---
+
+## Recon Object Detection (`detector.py`)
+
+Camera + Ultralytics YOLO (`yolov8n.pt`) classify mission objects; the front
+ultrasonic distance places them on the map (WHERE = ultrasonic, WHAT = YOLO).
+
+- **On by default** when a camera + model are available; disable with
+  `--no-detect`. Flags: `--camera N`, `--model PATH`, `--detect-conf F`,
+  `--detect-cooldown SEC`.
+- Runs in a **daemon background thread**; the telemetry loop only reads the
+  latest list. Never blocks navigation/mapping.
+- **Degrades gracefully**: missing cv2/ultralytics/camera/model → detection
+  disabled, `Detector.available=False`, app continues. The import in `main.py`
+  is itself guarded.
+- Mission classes → categories live ONLY in `detector.py` (`CATEGORY_OF`):
+  human (person); bag (backpack, suitcase, handbag); electronics (cell phone,
+  laptop); environment (chair, bottle, dining table→"table").
+- Per-category cooldown in `main.py` prevents map-tag spam.
+- Detections are neutral recon tags. Never label anything weapon/threat/danger.
+- First run downloads the model once (internet); then fully offline.
 
 ---
 

@@ -24,10 +24,12 @@ Examples
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import math
 import os
 import sys
+import time
 from datetime import datetime
 from typing import List, Optional
 
@@ -37,6 +39,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mapper import Mapper, LiveMap  # noqa: E402
 from scene import classify, risk_level  # noqa: E402
 from serial_bridge import make_source  # noqa: E402
+
+# Detector is optional; guard the import so the app runs without cv2/ultralytics.
+try:
+    from detector import Detector  # noqa: E402
+except Exception:  # pragma: no cover - import guarded for safety
+    Detector = None  # type: ignore
 
 
 def _repo_root() -> str:
@@ -78,10 +86,35 @@ def run(args: argparse.Namespace) -> int:
     map_png = os.path.join(log_dir, "map.png")
     status_path = os.path.join(log_dir, "status.json")
     points_csv = os.path.join(log_dir, f"points_{stamp}.csv")
+    detections_csv = os.path.join(log_dir, f"detections_{stamp}.csv")
 
     recent_events: List[dict] = []
     last_action: Optional[str] = None
     MAX_EVENTS = 20
+
+    # ----- recon detection state ------------------------------------------
+    detector = None
+    if not args.no_detect and Detector is not None:
+        detector = Detector(camera_index=args.camera, model_path=args.model,
+                            conf=args.detect_conf)
+        if detector.available:
+            detector.start()
+            print(f"[detect] camera {args.camera} + {args.model} active")
+        else:
+            print(f"[detect] disabled: {detector.error}")
+            detector = None
+    elif not args.no_detect and Detector is None:
+        print("[detect] disabled: opencv-python / ultralytics not installed")
+
+    recent_detections: List[dict] = []   # last N for status.json
+    detection_counts: dict = {}
+    cat_last_seen: dict = {}             # category -> monotonic time (cooldown)
+    MAX_RECENT_DET = 12
+
+    det_fh = open(detections_csv, "w", newline="", encoding="utf-8")
+    det_writer = csv.writer(det_fh)
+    det_writer.writerow(["timestamp", "category", "label", "confidence",
+                         "distance_cm", "x_cm", "y_cm", "note"])
 
     def _front_distance() -> Optional[float]:
         for angle, dist in reversed(mapper.last_scan):
@@ -122,6 +155,17 @@ def run(args: argparse.Namespace) -> int:
                     "obstacle_xy": [
                         [round(x, 1), round(y, 1)] for x, y in mapper.obstacle_points
                     ],
+                    # ----- recon detection (additive; absent fields are fine) -----
+                    "detections": recent_detections,
+                    "detection_tags": [
+                        {"x": t["x"], "y": t["y"], "category": t["category"],
+                         "label": t["label"], "conf": t["conf"],
+                         "note": t.get("note", "")}
+                        for t in mapper.detection_tags[-200:]
+                    ],
+                    "detection_counts": detection_counts,
+                    "detector": detector.stats() if detector is not None
+                    else {"enabled": False, "available": False},
                 }, fh)
         except OSError:
             pass
@@ -134,6 +178,56 @@ def run(args: argparse.Namespace) -> int:
     scan_since_classify = 0
     sweeps_since_png = 0
 
+    def poll_detections() -> bool:
+        """Pull the latest camera detections and tag them on the map.
+
+        A per-category cooldown prevents the same object from spamming the
+        map every frame. Placement uses the latest front ultrasonic distance;
+        if none is available the tag is marked distance_unknown. Returns True
+        if any new tag was added.
+        """
+        if detector is None:
+            return False
+        added = False
+        front = _front_distance()
+        now = time.monotonic()
+        for d in detector.get_latest():
+            cat = d["category"]
+            if now - cat_last_seen.get(cat, -1e9) < args.detect_cooldown:
+                continue
+            cat_last_seen[cat] = now
+
+            bearing = detector.bearing_deg(d.get("bbox_cx_frac", 0.5))
+            tag = mapper.add_detection_tag(cat, d["label"], d["confidence"],
+                                           front, bearing_deg=bearing)
+            detection_counts[cat] = detection_counts.get(cat, 0) + 1
+
+            rec = {
+                "ts": datetime.now().strftime("%H:%M:%S"),
+                "category": cat,
+                "label": d["label"],
+                "conf": d["confidence"],
+                "distance_cm": front,
+                "x": tag["x"],
+                "y": tag["y"],
+                "note": tag.get("note", ""),
+            }
+            recent_detections.insert(0, rec)
+            del recent_detections[MAX_RECENT_DET:]
+
+            dist_str = f"{front:.0f}cm" if front is not None else "dist?"
+            append_event(f"DET {cat}:{d['label']} {d['confidence']:.0%} @ {dist_str}")
+            det_writer.writerow([
+                datetime.now().isoformat(timespec="seconds"), cat, d["label"],
+                f"{d['confidence']:.3f}",
+                "" if front is None else f"{front:.1f}",
+                f"{tag['x']:.1f}", f"{tag['y']:.1f}", tag.get("note", ""),
+            ])
+            det_fh.flush()
+            print(f"[detect] {cat}:{d['label']} {d['confidence']:.0%} @ {dist_str}")
+            added = True
+        return added
+
     print(f"[main] DARKMAP-Q offline mapper - source={args.source}"
           + (f"  room={args.room}" if args.room else ""))
     print(f"[main] session log -> {session_path}")
@@ -144,6 +238,12 @@ def run(args: argparse.Namespace) -> int:
                          sim_steps=args.sim_steps, delay=args.delay,
                          room=args.room) as source:
             for line in source.lines():
+                # Camera detections run asynchronously; fold in any new tags.
+                if poll_detections():
+                    write_status(current_mode)
+                    if live:
+                        live.notify()
+
                 if not line:
                     continue
                 log_fh.write(line + "\n")
@@ -201,11 +301,23 @@ def run(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n[main] interrupted by user; finalizing...")
     finally:
+        if detector is not None:
+            detector.stop()
         log_fh.close()
+        det_fh.close()
+        # Drop the detections CSV if nothing was ever detected (header only).
+        if not mapper.detection_tags:
+            try:
+                os.remove(detections_csv)
+            except OSError:
+                pass
         # Always try to persist results.
         mapper.save_points_csv(points_csv)
         saved = mapper.save_map(map_png)
         print(f"[main] points  -> {points_csv}")
+        if mapper.detection_tags:
+            print(f"[main] detections -> {detections_csv} "
+                  f"({len(mapper.detection_tags)} tags)")
         if saved:
             print(f"[main] map png -> {saved}")
         print(f"[main] final pose=({mapper.pose.x:.1f},{mapper.pose.y:.1f}) "
@@ -243,6 +355,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help="delay between sim/file lines in seconds (default: 0.03)")
     p.add_argument("--log-dir", default=None,
                    help="override the log directory (default: data/logs)")
+    # ----- recon object detection (camera + YOLO) -----
+    p.add_argument("--no-detect", action="store_true",
+                   help="disable camera/YOLO recon detection (on by default if available)")
+    p.add_argument("--camera", type=int, default=0,
+                   help="camera index for detection (default: 0)")
+    p.add_argument("--model", default="yolov8n.pt",
+                   help="YOLO model path/name for detection (default: yolov8n.pt)")
+    p.add_argument("--detect-conf", type=float, default=0.45,
+                   help="detection confidence threshold (default: 0.45)")
+    p.add_argument("--detect-cooldown", type=float, default=3.0,
+                   help="seconds between map tags per category (default: 3.0)")
     p.add_argument("--room", default=None,
                    help=(
                        "room shape for --source wallsim. "
