@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 
 # Allow running from repo root or from inside linux/.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -78,15 +79,49 @@ def run(args: argparse.Namespace) -> int:
     status_path = os.path.join(log_dir, "status.json")
     points_csv = os.path.join(log_dir, f"points_{stamp}.csv")
 
-    def write_status(mode: str, scene: str) -> None:
+    recent_events: List[dict] = []
+    last_action: Optional[str] = None
+    MAX_EVENTS = 20
+
+    def _front_distance() -> Optional[float]:
+        for angle, dist in reversed(mapper.last_scan):
+            if angle == 0 and dist is not None and dist >= 0:
+                return float(dist)
+        return None
+
+    def append_event(message: str) -> None:
+        recent_events.insert(0, {
+            "ts": datetime.now().strftime("%H:%M:%S"),
+            "msg": message,
+        })
+        del recent_events[MAX_EVENTS:]
+
+    def write_status(mode: str, scene: Optional[str] = None) -> None:
+        if scene is not None:
+            nonlocal current_scene
+            current_scene = scene
+        front = _front_distance()
+        risk = risk_level(front) if front is not None else "CLEAR"
         try:
             with open(status_path, "w", encoding="utf-8") as fh:
                 json.dump({
                     "mode": mode,
-                    "scene": scene,
+                    "scene": current_scene,
+                    "risk": risk,
                     "last_distance_cm": mapper.last_distance_cm,
+                    "front_distance_cm": front,
                     "obstacles": len(mapper.obstacle_points),
+                    "path_points": len(mapper.path_points),
                     "pose": [round(mapper.pose.x, 1), round(mapper.pose.y, 1)],
+                    "theta_deg": round(math.degrees(mapper.pose.theta), 1),
+                    "last_scan": [[a, d] for a, d in mapper.last_scan],
+                    "last_action": last_action,
+                    "events": recent_events,
+                    "updated": datetime.now().strftime("%H:%M:%S"),
+                    "path": [[round(x, 1), round(y, 1)] for x, y in mapper.path_points],
+                    "obstacle_xy": [
+                        [round(x, 1), round(y, 1)] for x, y in mapper.obstacle_points
+                    ],
                 }, fh)
         except OSError:
             pass
@@ -95,6 +130,7 @@ def run(args: argparse.Namespace) -> int:
     live = None if args.no_plot else LiveMap(mapper, redraw_every=args.redraw_every)
 
     current_mode = "STOP"
+    current_scene = "UNKNOWN"
     scan_since_classify = 0
     sweeps_since_png = 0
 
@@ -129,32 +165,37 @@ def run(args: argparse.Namespace) -> int:
                         if rl == "HIGH":
                             print(f"[risk] HIGH - obstacle {dist:.0f}cm ahead")
 
-                    # Classify roughly once per full sweep.
-                    if scan_since_classify >= 7:
-                        scan_since_classify = 0
-                        sweeps_since_png += 1
-                        label = classify(mapper.last_scan, mode=current_mode)
-                        write_status(current_mode, label)
-                        # Refresh the saved PNG occasionally (for the dashboard).
-                        # Rendering is relatively expensive, so throttle it.
-                        if sweeps_since_png >= args.png_every:
-                            sweeps_since_png = 0
-                            mapper.save_map(map_png)
-                        print(f"[scene] {label:<13} "
-                              f"pose=({mapper.pose.x:6.1f},{mapper.pose.y:6.1f}) "
-                              f"obstacles={len(mapper.obstacle_points)}")
+                    if added or scan_since_classify >= 7:
+                        if scan_since_classify >= 7:
+                            scan_since_classify = 0
+                            sweeps_since_png += 1
+                            label = classify(mapper.last_scan, mode=current_mode)
+                            write_status(current_mode, scene=label)
+                            if sweeps_since_png >= args.png_every:
+                                sweeps_since_png = 0
+                                mapper.save_map(map_png)
+                            print(f"[scene] {label:<13} "
+                                  f"pose=({mapper.pose.x:6.1f},{mapper.pose.y:6.1f}) "
+                                  f"obstacles={len(mapper.obstacle_points)}")
+                        else:
+                            write_status(current_mode)
                     if added and live:
                         live.notify()
 
                 elif kind == "MOVE":
                     _, action, dur, speed = parsed
                     mapper.apply_move(action, dur, speed)
+                    last_action = f"{action} {dur:.0f}ms"
+                    append_event(last_action)
+                    write_status(current_mode)
                     if live:
                         live.notify()
 
                 elif kind == "STATE":
                     _, mode, message = parsed
                     current_mode = mode or current_mode
+                    append_event(message)
+                    write_status(current_mode)
                     print(f"[state] mode={current_mode} :: {message}")
 
     except KeyboardInterrupt:
