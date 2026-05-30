@@ -52,7 +52,9 @@
 
 #define SERVO_PIN         10  // PWM output to servo signal
 #define ULTRASONIC_TRIG   13  // HC-SR04 trigger (moved off AIN1/BIN1)
-#define ULTRASONIC_ECHO   12   // HC-SR04 echo — MUST go through voltage divider
+#define ULTRASONIC_ECHO   12  // HC-SR04 echo — MUST go through voltage divider
+
+#define MODE_BUTTON_PIN   2   // SmartCar Shield v1.1 mode button (INT0)
 
 // ---------------------------------------------------------------------------
 // Tunable behavior constants  (start slow for clean mapping + safety)
@@ -100,6 +102,17 @@ Mode currentMode = MODE_STOP;  // start safe: motors off until told to run
 // rover always starts with a fresh "drive to wall" acquisition pass.
 bool wf_acquired = false;
 
+// ---------------------------------------------------------------------------
+// Mode button (pin 2 / INT0) — toggle WALLFOLLOW on/off
+// ---------------------------------------------------------------------------
+volatile bool buttonPressed  = false;
+unsigned long lastDebounceMs = 0;
+const unsigned long DEBOUNCE_MS = 200;
+
+void onModeButton() {
+  buttonPressed = true;
+}
+
 Servo scanServo;
 
 // Forward declarations
@@ -136,7 +149,7 @@ long scanRightWall() {
 // Setup
 // ===========================================================================
 void setup() {
-  Serial.begin(115200);
+  Serial.begin(9600);
 
   pinMode(PWMA,  OUTPUT);
   pinMode(PWMB,  OUTPUT);
@@ -148,6 +161,9 @@ void setup() {
   pinMode(ULTRASONIC_TRIG, OUTPUT);
   pinMode(ULTRASONIC_ECHO, INPUT);
   digitalWrite(ULTRASONIC_TRIG, LOW);
+
+  pinMode(MODE_BUTTON_PIN, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(MODE_BUTTON_PIN), onModeButton, FALLING);
 
   scanServo.attach(SERVO_PIN);
   scanServo.write(SERVO_CENTER);
@@ -161,6 +177,24 @@ void setup() {
 // Main loop
 // ===========================================================================
 void loop() {
+  // Physical mode button: toggles WALLFOLLOW on/off (debounced).
+  if (buttonPressed) {
+    buttonPressed = false;
+    if (millis() - lastDebounceMs > DEBOUNCE_MS) {
+      lastDebounceMs = millis();
+      if (currentMode == MODE_WALLFOLLOW) {
+        currentMode = MODE_STOP;
+        stopCar();
+        sendState("mode_stop");
+      } else {
+        currentMode = MODE_WALLFOLLOW;
+        wf_acquired = false;
+        stopCar();
+        sendState("mode_wallfollow");
+      }
+    }
+  }
+
   // Always service incoming single-character commands first (mode + manual).
   if (Serial.available() > 0) {
     char cmd = (char) Serial.read();
