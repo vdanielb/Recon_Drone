@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 """UNO Q board-side telemetry relay for DARKMAP-Q.
+PUT THIS IN MAIN.PY ON THE ARDUINO
 
 Runs on the Arduino UNO Q Linux side inside Arduino App Lab (paired with
 ``arduino/working.ino`` on the MCU).  The sketch pushes CSV lines via
 ``Bridge.notify("telemetry", ...)``; this script receives them and forwards
 each line over TCP to the laptop running ``main.py --source net``.
 
-Configure the laptop address before starting the App:
+Join the laptop's Wi-Fi hotspot first (see ``join_hotspot.sh``).  The default
+target is the Windows Mobile Hotspot gateway (``192.168.137.1``).  Override only
+if your laptop uses a different subnet:
 
-    export DARKMAP_LAPTOP_HOST=192.168.1.42   # your laptop's LAN IP
+    export DARKMAP_LAPTOP_HOST=192.168.137.1  # default; Windows hotspot gateway
     export DARKMAP_LAPTOP_PORT=9009           # must match --listen-port
 
 Do **not** run this on the laptop — use ``main.py --source net`` there instead.
@@ -29,7 +32,8 @@ except ImportError as exc:  # pragma: no cover - only available on UNO Q
         "On the laptop use: python3 main.py --source net"
     ) from exc
 
-LAPTOP_HOST = os.environ.get("DARKMAP_LAPTOP_HOST", "192.168.1.100")
+# Windows Mobile Hotspot always uses 192.168.137.1 (ICS gateway).
+LAPTOP_HOST = os.environ.get("DARKMAP_LAPTOP_HOST", "192.168.137.1")
 LAPTOP_PORT = int(os.environ.get("DARKMAP_LAPTOP_PORT", "9009"))
 RECONNECT_SEC = float(os.environ.get("DARKMAP_RECONNECT_SEC", "2.0"))
 
