@@ -25,6 +25,7 @@ Exit codes: 0 if the detector is available and ran; 1 if it could not start
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -33,9 +34,31 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detector import Detector, CATEGORY_OF, display_label  # noqa: E402
 
-_LINUX_DIR = os.path.dirname(os.path.abspath(__file__))
+_LINUX_DIR  = os.path.dirname(os.path.abspath(__file__))
 _REPO_ROOT  = os.path.dirname(_LINUX_DIR)
 _DEFAULT_FRAME_PATH = os.path.join(_REPO_ROOT, "data", "logs", "camera_frame.jpg")
+_STATUS_JSON = os.path.join(_REPO_ROOT, "data", "logs", "status.json")
+_MAX_RECENT  = 50   # cap on recent detections kept in status.json
+
+
+def _write_status(det: "Detector", counts: dict, recent: list) -> None:
+    """Write detection state to status.json so dashboard.py can read it."""
+    try:
+        os.makedirs(os.path.dirname(_STATUS_JSON), exist_ok=True)
+        payload = {
+            "mode": "SCAN_ONLY",
+            "detection_counts": counts,
+            "detections": recent,
+            "detection_tags": [],
+            "detector": det.stats(),
+            "updated": time.strftime("%H:%M:%S"),
+        }
+        tmp = _STATUS_JSON + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+        os.replace(tmp, _STATUS_JSON)
+    except OSError:
+        pass
 
 
 def _print_categories() -> None:
@@ -67,9 +90,14 @@ def run(args: argparse.Namespace) -> int:
 
     det.start()
     print("[test] detector running. Press Ctrl-C to stop.")
+    print(f"[test] writing status -> {_STATUS_JSON}")
 
     show = args.show
     cv2 = det._cv2  # already imported and guarded inside Detector
+
+    counts: dict = {}
+    recent: list = []
+    was_present: dict = {}   # category -> bool, tracks rising-edge entries
 
     try:
         frames = 0
@@ -77,6 +105,14 @@ def run(args: argparse.Namespace) -> int:
             time.sleep(0.2)
             dets = det.get_latest()
             frames += 1
+
+            # Which categories are visible right now
+            now_present: dict = {}
+            for d in dets:
+                cat = d["category"]
+                # Keep the highest-confidence detection per category
+                if cat not in now_present or d["confidence"] > now_present[cat]["confidence"]:
+                    now_present[cat] = d
 
             if dets:
                 summary = ", ".join(
@@ -86,6 +122,29 @@ def run(args: argparse.Namespace) -> int:
                 print(f"[det] {summary}")
             else:
                 print("[det] (no mission objects)")
+
+            # Rising-edge: only count when a category appears fresh (was absent)
+            for cat, d in now_present.items():
+                if not was_present.get(cat, False):
+                    counts[cat] = counts.get(cat, 0) + 1
+                    recent.insert(0, {
+                        "ts":          time.strftime("%H:%M:%S"),
+                        "category":    cat,
+                        "label":       d["label"],
+                        "conf":        round(d["confidence"], 3),
+                        "distance_cm": -1,
+                    })
+                    del recent[_MAX_RECENT:]
+                    print(f"[count] new {cat} entry → total {counts[cat]}")
+
+            # Update presence state for next frame
+            for cat in list(was_present.keys()):
+                if cat not in now_present:
+                    was_present[cat] = False
+            for cat in now_present:
+                was_present[cat] = True
+
+            _write_status(det, counts, recent)
 
             if show and cv2 is not None and det._cap is not None:
                 ok, frame = det._cap.read()
