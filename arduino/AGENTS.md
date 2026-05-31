@@ -1,1 +1,1 @@
-The goal of the working.ino here is to guide the robot to hug the wall while doing a sweep scan with a supersonic sensor. The readings from the sensor are later going to be used to build a 2D map of the room. Ignore sketch.ino for now, just work on working.ino
+The goal of the sketch.ino here is to guide the robot to hug the wall while doing a sweep scan with a supersonic sensor. The readings from the sensor are later going to be used to build a 2D map of the room.
