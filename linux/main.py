@@ -236,7 +236,9 @@ def run(args: argparse.Namespace) -> int:
     try:
         with make_source(args.source, port=args.port, file=args.file,
                          sim_steps=args.sim_steps, delay=args.delay,
-                         room=args.room) as source:
+                         room=args.room,
+                         listen_host=args.listen_host,
+                         listen_port=args.listen_port) as source:
             for line in source.lines():
                 # Camera detections run asynchronously; fold in any new tags.
                 if poll_detections():
@@ -334,11 +336,16 @@ def run(args: argparse.Namespace) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="DARKMAP-Q offline mapping app")
     p.add_argument("--source", default="sim",
-                   choices=["serial", "file", "stdin", "sim", "wallsim"],
+                   choices=["serial", "file", "stdin", "sim", "wallsim", "net"],
                    help="telemetry source (default: sim); "
-                        "use 'wallsim' to simulate the WALLFOLLOW mode")
+                        "use 'wallsim' to simulate WALLFOLLOW; "
+                        "use 'net' for WiFi TCP from the UNO Q board")
     p.add_argument("--port", default=None,
                    help="serial port (e.g. /dev/ttyACM0); auto-detect if omitted")
+    p.add_argument("--listen-host", default="0.0.0.0",
+                   help="bind address for --source net (default: 0.0.0.0)")
+    p.add_argument("--listen-port", type=int, default=9009,
+                   help="TCP port for --source net (default: 9009)")
     p.add_argument("--file", default=None,
                    help="path to a saved session log (for --source file)")
     p.add_argument("--no-plot", action="store_true",

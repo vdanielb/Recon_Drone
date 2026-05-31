@@ -1,6 +1,7 @@
 // last working sketch
 
 #include <Servo.h>
+#include <Arduino_RouterBridge.h>
 
 // Elegoo V4 motor pins (TB6612 shield)
 #define PWMA 5
@@ -36,7 +37,7 @@ const int SERVO_SETTLE_MS = 80;
 // Button debounce
 const unsigned long DEBOUNCE_MS = 40;
 
-// Wall-follow debug telemetry (wf_decide STATE lines on Monitor)
+// Wall-follow debug telemetry (wf_decide STATE lines forwarded to laptop)
 #define DEBUG_WF 1
 
 // Staleness cap for last valid left-wall reading when side scan fails
@@ -78,35 +79,24 @@ int servoToTelemetry(int servoDeg) {
   return SERVO_CENTER - servoDeg;
 }
 
+// Push one CSV telemetry line to the UNO Q Linux side via Bridge RPC.
+void emitTelemetry(const String &line) {
+  Bridge.notify("telemetry", line.c_str());
+}
+
 void emitScan(int angleDeg, long distanceCm) {
-  Monitor.print("SCAN,");
-  Monitor.print(millis());
-  Monitor.print(",");
-  Monitor.print(angleDeg);
-  Monitor.print(",");
-  Monitor.print(distanceCm);
-  Monitor.print(",");
-  Monitor.println(currentMode);
+  emitTelemetry("SCAN," + String(millis()) + "," + String(angleDeg) + ","
+                + String(distanceCm) + "," + currentMode);
 }
 
 void emitMove(const char *action, int durationMs, int speed) {
-  Monitor.print("MOVE,");
-  Monitor.print(millis());
-  Monitor.print(",");
-  Monitor.print(action);
-  Monitor.print(",");
-  Monitor.print(durationMs);
-  Monitor.print(",");
-  Monitor.println(speed);
+  emitTelemetry("MOVE," + String(millis()) + "," + String(action) + ","
+                + String(durationMs) + "," + String(speed));
 }
 
 void emitState(const char *message) {
-  Monitor.print("STATE,");
-  Monitor.print(millis());
-  Monitor.print(",");
-  Monitor.print(currentMode);
-  Monitor.print(",");
-  Monitor.println(message);
+  emitTelemetry("STATE," + String(millis()) + "," + currentMode + ","
+                + String(message));
 }
 
 void setMode(const String &mode) {
@@ -305,16 +295,9 @@ long resolveLeftDistance(long rawLeftCm, bool *rawValidOut) {
 #if DEBUG_WF
 void emitWfDecide(long frontCm, long leftCm, bool leftRawValid,
                   const char *branch) {
-  Monitor.print("STATE,");
-  Monitor.print(millis());
-  Monitor.print(",WALLFOLLOW,wf_decide,f=");
-  Monitor.print(frontCm);
-  Monitor.print(",l=");
-  Monitor.print(leftCm);
-  Monitor.print(",lv=");
-  Monitor.print(leftRawValid ? 1 : 0);
-  Monitor.print(",b=");
-  Monitor.println(branch);
+  emitTelemetry("STATE," + String(millis()) + ",WALLFOLLOW,wf_decide,f="
+                + String(frontCm) + ",l=" + String(leftCm) + ",lv="
+                + String(leftRawValid ? 1 : 0) + ",b=" + String(branch));
 }
 #endif
 
@@ -418,6 +401,7 @@ void handleButton() {
 
 void setup() {
   Monitor.begin(9600);
+  Bridge.begin();
 
   pinMode(PWMA, OUTPUT);
   pinMode(PWMB, OUTPUT);

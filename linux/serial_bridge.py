@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import math
 import random
+import socket
 import sys
 import time
 from typing import Iterator, Optional
@@ -137,6 +138,69 @@ class StdinSource(TelemetrySource):
             line = raw.strip()
             if line:
                 yield line
+
+
+class NetworkSource(TelemetrySource):
+    """Accept CSV telemetry over TCP from the UNO Q board relay.
+
+    The board's ``uno_q_forwarder.py`` connects as a client and streams
+    newline-delimited SCAN / MOVE / STATE lines.  This source binds a TCP
+    server on the laptop and yields lines from the active connection.
+    On disconnect it waits for the board to reconnect.
+    """
+
+    def __init__(self, host: str = "0.0.0.0", port: int = 9009) -> None:
+        self.host = host
+        self.port = port
+        self._server: Optional[socket.socket] = None
+        self._conn: Optional[socket.socket] = None
+
+    def lines(self) -> Iterator[str]:
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind((self.host, self.port))
+        self._server.listen(1)
+        print(f"[net] listening on {self.host}:{self.port} (waiting for board)")
+
+        buffer = ""
+        while True:
+            if self._conn is None:
+                self._conn, addr = self._server.accept()
+                self._conn.settimeout(None)
+                print(f"[net] client connected from {addr[0]}:{addr[1]}")
+                buffer = ""
+
+            try:
+                data = self._conn.recv(4096)
+                if not data:
+                    print("[net] client disconnected; waiting for reconnect...")
+                    self._drop_client()
+                    continue
+
+                buffer += data.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if line:
+                        yield line
+            except (ConnectionResetError, BrokenPipeError, OSError) as exc:
+                print(f"[net] connection lost ({exc}); waiting for reconnect...")
+                self._drop_client()
+
+    def _drop_client(self) -> None:
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            finally:
+                self._conn = None
+
+    def close(self) -> None:
+        self._drop_client()
+        if self._server is not None:
+            try:
+                self._server.close()
+            finally:
+                self._server = None
 
 
 class SimSource(TelemetrySource):
@@ -562,7 +626,9 @@ class WallFollowSimSource(TelemetrySource):
 
 def make_source(kind: str, port: Optional[str] = None, file: Optional[str] = None,
                 sim_steps: int = 120, delay: float = 0.05,
-                room: Optional[str] = None) -> TelemetrySource:
+                room: Optional[str] = None,
+                listen_host: str = "0.0.0.0",
+                listen_port: int = 9009) -> TelemetrySource:
     """Factory used by main.py to build the requested telemetry source."""
     kind = (kind or "sim").lower()
     if kind == "serial":
@@ -573,6 +639,8 @@ def make_source(kind: str, port: Optional[str] = None, file: Optional[str] = Non
         return FileSource(file, delay=delay)
     if kind == "stdin":
         return StdinSource()
+    if kind == "net":
+        return NetworkSource(host=listen_host, port=listen_port)
     if kind == "sim":
         return SimSource(steps=sim_steps, delay=delay)
     if kind == "wallsim":
