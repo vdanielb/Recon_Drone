@@ -7,6 +7,50 @@ maps pitch-black, GPS-denied environments with no internet connection. A
 servo-mounted ultrasonic sensor scans the surroundings, the rover avoids
 obstacles autonomously, and an onboard Linux process builds a rough 2D map.
 
+## Quick start (live run over Wi-Fi, no router, no internet)
+
+Telemetry streams from the board to the laptop over the laptop's own Wi-Fi
+hotspot. Roles: the laptop is the Wi-Fi host **and** the TCP server; the UNO Q
+joins the hotspot and connects out to it.
+
+**1. Laptop - turn on the hotspot (one time):**
+- Settings -> Network & Internet -> Mobile hotspot -> On (set an SSID/password,
+  share over Wi-Fi). The laptop becomes `192.168.137.1`.
+- Allow the telemetry port through the firewall (admin PowerShell, one time):
+  ```powershell
+  netsh advfirewall firewall add rule name="DARKMAP net 9009" dir=in action=allow protocol=TCP localport=9009
+  ```
+
+**2. UNO Q - join the hotspot (one time):**
+```bash
+./linux/join_hotspot.sh "<SSID>" "<PASSWORD>"   # should print gateway 192.168.137.1
+```
+
+**3. Laptop - start the receiver (headless; dashboard provides the view):**
+```powershell
+cd linux
+python main.py --source net --no-plot
+```
+
+**4. Laptop - start the offline dashboard (second terminal):**
+```powershell
+cd linux
+python dashboard.py
+```
+Open http://127.0.0.1:8000 (add `--host 0.0.0.0` to view from a phone on the
+hotspot at http://192.168.137.1:8000).
+
+**5. UNO Q - run the rover:** launch the App Lab project (`arduino/working.ino`
+on the MCU + `linux/uno_q_forwarder.py` on the Linux side). When connected the
+laptop prints `[net] client connected from 192.168.137.x`.
+
+**6. Press the rover's button** to enter `WALLFOLLOW`. Telemetry starts flowing
+and the map fills in. Press again to STOP.
+
+> No hardware? Skip steps 1-2 and 5-6 and run the simulator instead:
+> `python main.py --source wallsim --room square:300 --sim-steps 300` (then open
+> the dashboard).
+
 ## Problem
 
 Indoor, underground, and signal-denied spaces have no GPS and often no light.
@@ -31,7 +75,8 @@ everything runs offline.
 - RC car chassis + DC motors + motor driver board
 - SG90 servo + HC-SR04 ultrasonic sensor (ECHO level-shifted to 3.3 V)
 - Motor battery pack, common ground, 5 V / 3 A USB-C board supply
-- Optional: MPU6050 IMU, camera
+- MPU6050 gyro (I2C: SDA=A4, SCL=A5, **3.3 V** power) for exact turns + map heading
+- Optional: camera
 
 See [docs/wiring.md](docs/wiring.md) for the full pin map, the required HC-SR04
 voltage divider, and power/ground rules.
@@ -52,7 +97,7 @@ flowchart LR
     dash[dashboard.py optional]
     bridge --> app --> map --> dash
   end
-  auto -->|"CSV: SCAN / MOVE / STATE"| bridge
+  auto -->|"CSV: SCAN / MOVE / STATE / HEADING"| bridge
   app -->|logs + map.png| logs[(data/logs)]
 ```
 
@@ -61,7 +106,8 @@ flowchart LR
 ```text
 SCAN,timestamp_ms,angle_deg,distance_cm,mode
 MOVE,timestamp_ms,action,duration_ms,speed      # action: FORWARD/BACKWARD/TURN_LEFT/TURN_RIGHT/STOP
-STATE,timestamp_ms,mode,message                 # mode: AUTO/MANUAL/SCAN_ONLY/STOP
+STATE,timestamp_ms,mode,message                 # mode: AUTO/MANUAL/SCAN_ONLY/WALLFOLLOW/STOP
+HEADING,timestamp_ms,yaw_deg                    # optional; MPU6050 gyro (CCW-positive degrees)
 ```
 
 ## Repository layout

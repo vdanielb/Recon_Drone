@@ -1,6 +1,8 @@
 // last working sketch
 
 #include <Servo.h>
+#include <Wire.h>
+#include <math.h>
 #include <Arduino_RouterBridge.h>
 
 // Elegoo V4 motor pins (TB6612 shield)
@@ -27,6 +29,15 @@ const int WF_CORNER_THRESHOLD_CM = 25;
 const int WF_OPEN_THRESHOLD_CM   = 50;
 const int BASE_SPEED             = 120;
 const int TURN_SPEED             = 120;
+
+// MPU6050 gyro (I2C: SDA=A4, SCL=A5) — exact turns + heading telemetry
+#define MPU_ADDR                 0x68
+const float GYRO_SENS              = 131.0f;  // LSB/(deg/s) at +/-250 deg/s
+const int GYRO_SIGN                = 1;       // flip to -1 if left turn reads negative
+const int WF_TURN_ANGLE_DEG        = 90;
+const int NUDGE_ANGLE_DEG          = 12;
+const unsigned long TURN_TIMEOUT_MS = 3000UL;
+const int GYRO_BIAS_SAMPLES        = 1000;
 
 // Ultrasonic limits
 const unsigned long ECHO_TIMEOUT_US = 25000UL;  // ~4.3 m round-trip cap
@@ -67,6 +78,12 @@ long lastFrontDistCm = -1;
 long lastValidLeftCm = -1;
 unsigned long lastValidLeftMs = 0;
 
+// MPU6050 state (continuous unwrapped yaw for closed-loop turns)
+bool imuOk = false;
+float yawDeg = 0.0f;
+float gyroBiasZ = 0.0f;
+unsigned long lastYawUs = 0;
+
 // ---------------------------------------------------------------------------
 // Telemetry helpers
 // ---------------------------------------------------------------------------
@@ -99,6 +116,8 @@ void emitState(const char *message) {
                 + String(message));
 }
 
+void emitHeading();
+
 void setMode(const String &mode) {
   if (currentMode == mode) {
     return;
@@ -118,6 +137,97 @@ void setMode(const String &mode) {
 }
 
 // ---------------------------------------------------------------------------
+// MPU6050 gyro (raw Wire — no external library)
+// ---------------------------------------------------------------------------
+
+void mpuWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+int16_t mpuReadGyroZ() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x47);  // GYRO_ZOUT_H
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)2, (uint8_t)true);
+  if (Wire.available() < 2) {
+    return 0;
+  }
+  int16_t hi = Wire.read();
+  int16_t lo = Wire.read();
+  return (int16_t)((hi << 8) | lo);
+}
+
+bool mpuInit() {
+  Wire.begin();
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x75);  // WHO_AM_I
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)1, (uint8_t)true);
+  if (Wire.available() < 1 || Wire.read() != 0x68) {
+    return false;
+  }
+  mpuWrite(0x6B, 0x00);  // wake
+  mpuWrite(0x1A, 0x03);  // DLPF ~44 Hz
+  mpuWrite(0x1B, 0x00);  // gyro +/-250 deg/s
+  delay(50);
+  lastYawUs = micros();
+  return true;
+}
+
+void calibrateGyroBias() {
+  if (!imuOk) {
+    emitState("imu_absent");
+    return;
+  }
+  emitState("imu_calibrating");
+  delay(500);
+  float sum = 0.0f;
+  for (int i = 0; i < GYRO_BIAS_SAMPLES; i++) {
+    sum += (float)mpuReadGyroZ();
+    delay(2);
+  }
+  gyroBiasZ = sum / (float)GYRO_BIAS_SAMPLES;
+  yawDeg = 0.0f;
+  lastYawUs = micros();
+  emitState("imu_ready");
+}
+
+void updateYaw() {
+  if (!imuOk) {
+    return;
+  }
+  unsigned long nowUs = micros();
+  float dt = (nowUs - lastYawUs) / 1000000.0f;
+  lastYawUs = nowUs;
+  if (dt <= 0.0f || dt > 0.5f) {
+    return;
+  }
+  float gz = (float)mpuReadGyroZ() - gyroBiasZ;
+  yawDeg += (float)GYRO_SIGN * (gz / GYRO_SENS) * dt;
+}
+
+float wrapYawDeg(float deg) {
+  while (deg > 180.0f) {
+    deg -= 360.0f;
+  }
+  while (deg < -180.0f) {
+    deg += 360.0f;
+  }
+  return deg;
+}
+
+void emitHeading() {
+  if (!imuOk) {
+    return;
+  }
+  emitTelemetry("HEADING," + String(millis()) + ","
+                + String(wrapYawDeg(yawDeg), 2));
+}
+
+// ---------------------------------------------------------------------------
 // Motor control
 // ---------------------------------------------------------------------------
 
@@ -126,14 +236,76 @@ void stopMotors() {
   analogWrite(PWMB, 0);
 }
 
+void setLeftSpin() {
+  digitalWrite(AIN1, LOW);
+  digitalWrite(BIN1, HIGH);
+  analogWrite(PWMA, TURN_SPEED);
+  analogWrite(PWMB, TURN_SPEED);
+}
+
+void setRightSpin() {
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(BIN1, LOW);
+  analogWrite(PWMA, TURN_SPEED);
+  analogWrite(PWMB, TURN_SPEED);
+}
+
+int fallbackTurnMs(float deltaDeg) {
+  return (int)((fabs(deltaDeg) / 90.0f) * (float)WF_TURN90_MS + 0.5f);
+}
+
 void driveForward(int durationMs) {
   digitalWrite(AIN1, HIGH);
   digitalWrite(BIN1, HIGH);
   analogWrite(PWMA, BASE_SPEED);
   analogWrite(PWMB, BASE_SPEED);
-  delay(durationMs);
+  unsigned long t0 = millis();
+  while (millis() - t0 < (unsigned long)durationMs) {
+    if (imuOk) {
+      updateYaw();
+    } else {
+      delay(1);
+    }
+  }
   stopMotors();
   emitMove("FORWARD", durationMs, BASE_SPEED);
+  if (imuOk) {
+    emitHeading();
+  }
+}
+
+void turnByAngle(float deltaDeg) {
+  if (!imuOk) {
+    int ms = fallbackTurnMs(deltaDeg);
+    if (deltaDeg >= 0.0f) {
+      turnLeft(ms);
+    } else {
+      turnRight(ms);
+    }
+    return;
+  }
+
+  float startYaw = yawDeg;
+  float target = fabs(deltaDeg);
+  if (deltaDeg >= 0.0f) {
+    setLeftSpin();
+  } else {
+    setRightSpin();
+  }
+
+  unsigned long t0 = millis();
+  while (fabs(yawDeg - startYaw) < target && millis() - t0 < TURN_TIMEOUT_MS) {
+    updateYaw();
+  }
+  stopMotors();
+
+  unsigned long elapsed = millis() - t0;
+  if (deltaDeg >= 0.0f) {
+    emitMove("TURN_LEFT", (int)elapsed, TURN_SPEED);
+  } else {
+    emitMove("TURN_RIGHT", (int)elapsed, TURN_SPEED);
+  }
+  emitHeading();
 }
 
 void turnLeft(int durationMs) {
@@ -193,7 +365,8 @@ long clampDistance(long distanceCm) {
     return DIST_MIN_CM;
   }
   if (distanceCm > DIST_MAX_CM) {
-    return DIST_MAX_CM;
+    // Out of range: report invalid rather than a fake wall at DIST_MAX_CM.
+    return -1;
   }
   return distanceCm;
 }
@@ -306,6 +479,10 @@ void emitWfDecide(long frontCm, long leftCm, bool leftRawValid,
 // ---------------------------------------------------------------------------
 
 void wallFollowStep() {
+  if (imuOk) {
+    updateYaw();
+    emitHeading();
+  }
   fullSweep();
 
   long frontRaw = lastFrontDistCm;
@@ -318,7 +495,7 @@ void wallFollowStep() {
   // so the wall sits on the left, then nudge forward to clear the corner.
   if (!wf_acquired) {
     if (frontRaw >= 0 && frontRaw <= WF_CORNER_THRESHOLD_CM) {
-      turnLeft(WF_TURN90_MS);
+      turnByAngle((float)WF_TURN_ANGLE_DEG);
       driveForward(FORWARD_PULSE_MS);
       wf_acquired = true;
       emitState("wf_acquired");
@@ -339,27 +516,27 @@ void wallFollowStep() {
   if (frontRaw >= 0 && frontRaw <= WF_CORNER_THRESHOLD_CM) {
     // Inner corner: something ahead. Turn away from the left wall.
     emitState("wf_corner");
-    turnLeft(WF_TURN90_MS);
+    turnByAngle((float)WF_TURN_ANGLE_DEG);
 #if DEBUG_WF
     emitWfDecide(frontRaw, left, leftRawValid, "inner");
 #endif
   } else if (leftRawValid && leftRaw > WF_OPEN_THRESHOLD_CM) {
     // Outer corner: left wall ended. Overshoot, then wrap toward the wall.
     driveForward(FORWARD_PULSE_MS);
-    turnRight(WF_TURN90_MS);
+    turnByAngle((float)(-WF_TURN_ANGLE_DEG));
 #if DEBUG_WF
     emitWfDecide(front, leftRaw, true, "outer");
 #endif
   } else if (left >= 0 && left > TARGET_WALL_CM + WALL_TOLERANCE_CM) {
     // Drifting away from the left wall: nudge back toward it.
-    turnRight(TURN_PULSE_MS / 2);
+    turnByAngle((float)(-NUDGE_ANGLE_DEG));
     driveForward(FORWARD_PULSE_MS);
 #if DEBUG_WF
     emitWfDecide(front, left, leftRawValid, "nudge_to_wall");
 #endif
   } else if (left >= 0 && left < TARGET_WALL_CM - WALL_TOLERANCE_CM) {
     // Too close to the left wall: nudge away from it.
-    turnLeft(TURN_PULSE_MS / 2);
+    turnByAngle((float)NUDGE_ANGLE_DEG);
     driveForward(FORWARD_PULSE_MS);
 #if DEBUG_WF
     emitWfDecide(front, left, leftRawValid, "nudge_off_wall");
@@ -418,11 +595,17 @@ void setup() {
   scanServo.attach(SERVO_PIN);
   scanServo.write(SERVO_CENTER);
 
+  imuOk = mpuInit();
+  calibrateGyroBias();
+
   stopMotors();
   emitState("ready");
 }
 
 void loop() {
+  if (imuOk) {
+    updateYaw();
+  }
   handleButton();
 
   if (currentMode == "WALLFOLLOW") {

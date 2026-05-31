@@ -24,8 +24,15 @@ from typing import List, Optional, Tuple
 
 
 # Calibration values - tune these against the real rover during testing.
-SPEED_CM_PER_SEC = 12.0   # forward speed estimate
-TURN_DEG_PER_SEC = 90.0   # in-place turn rate estimate
+# These are RATES, and apply_move() scales them by each MOVE packet's
+# duration_ms. So changing FORWARD_PULSE_MS / WF_TURN90_MS in the sketch needs
+# NO change here (the new duration arrives in the packet). Only re-measure when
+# the rover's physical speed/turn-rate changes (motors, battery, surface, load).
+#
+# 23.0 cm/s: measured 11.5 cm per 500 ms forward pulse -> 11.5 / 0.5 = 23.0.
+SPEED_CM_PER_SEC = 23.0   # forward speed estimate
+# 180.0 deg/s: ~90 deg per 500 ms in-place turn -> 90 / 0.5 = 180.
+TURN_DEG_PER_SEC = 180.0  # in-place turn rate estimate
 
 # Recon detection category -> marker color (shared concept with the dashboard).
 CATEGORY_COLORS = {
@@ -58,12 +65,20 @@ class Mapper:
     last_scan: List[Tuple[int, float]] = field(default_factory=list)  # (angle, dist)
     # Camera/YOLO recon tags: {x, y, category, label, conf, note}
     detection_tags: List[dict] = field(default_factory=list)
+    # When True, HEADING packets own theta; skip turn dead-reckoning on MOVE.
+    _imu_heading: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         # Seed the path with the starting position.
         self.path_points.append((self.pose.x, self.pose.y))
 
     # ----- pose updates (dead reckoning) -----------------------------------
+    def set_heading(self, yaw_deg: float) -> None:
+        """Set pose heading from MPU6050 HEADING telemetry (CCW-positive degrees)."""
+        self.pose.theta = math.radians(yaw_deg)
+        self.pose.theta = _wrap_angle(self.pose.theta)
+        self._imu_heading = True
+
     def apply_move(self, action: str, duration_ms: float, speed: float = 0.0) -> None:
         """Update the pose estimate from a MOVE event."""
         action = action.upper()
@@ -77,10 +92,10 @@ class Mapper:
             self.pose.y += dist * math.sin(self.pose.theta)
             self.path_points.append((self.pose.x, self.pose.y))
 
-        elif action in ("TURN_LEFT", "LEFT"):
+        elif action in ("TURN_LEFT", "LEFT") and not self._imu_heading:
             self.pose.theta += math.radians(self.turn_deg_per_sec * seconds)
 
-        elif action in ("TURN_RIGHT", "RIGHT"):
+        elif action in ("TURN_RIGHT", "RIGHT") and not self._imu_heading:
             self.pose.theta -= math.radians(self.turn_deg_per_sec * seconds)
 
         elif action == "STOP":

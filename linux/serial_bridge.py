@@ -257,7 +257,13 @@ class SimSource(TelemetrySource):
             return -1.0
         return noisy
 
+    def _heading_line(self):
+        yaw = math.degrees(self.theta)
+        yaw = (yaw + 180.0) % 360.0 - 180.0
+        yield f"HEADING,{self._t()},{yaw:.2f}"
+
     def _scan_lines(self):
+        yield from self._heading_line()
         for ang in self.SCAN_ANGLES:
             world = self.theta + math.radians(ang)
             dist = self._wall_distance(world)
@@ -524,7 +530,13 @@ class WallFollowSimSource(TelemetrySource):
             return -1.0
         return min(readings)
 
+    def _heading_line(self):
+        yaw = math.degrees(self.theta)
+        yaw = (yaw + 180.0) % 360.0 - 180.0
+        yield f"HEADING,{self._t()},{yaw:.2f}"
+
     def _scan_lines(self):
+        yield from self._heading_line()
         for ang in self.SCAN_ANGLES:
             d = self._dist(ang)
             d_out = int(d) if d >= 0 else -1

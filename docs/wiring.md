@@ -16,6 +16,8 @@
 | Ultrasonic TRIG       | D7        | output; 3.3 V trigger is accepted by HC-SR04     |
 | Ultrasonic ECHO       | D8        | input; **must go through a voltage divider**     |
 | Common ground         | GND       | shared by UNO Q, motor driver, motor battery     |
+| MPU6050 SDA           | A4        | I2C data (`working.ino`; **3.3 V** module power) |
+| MPU6050 SCL           | A5        | I2C clock                                        |
 
 > Do **not** use D3 for the ECHO input. D3 is not 5 V tolerant. Verify each pin
 > against your specific motor driver board and UNO Q carrier before powering on.
@@ -61,6 +63,21 @@ UNO Q GND           ---> servo GND
 UNO Q D11 (PWM)     ---> servo signal
 ```
 
+## MPU6050 (gyro heading + exact turns)
+
+Used by `arduino/working.ino` for closed-loop 90° corner turns and `HEADING`
+telemetry to the mapper.
+
+```text
+MPU6050 VCC ---> UNO Q 3.3 V   (NOT 5 V)
+MPU6050 GND ---> UNO Q GND
+MPU6050 SDA ---> A4
+MPU6050 SCL ---> A5
+```
+
+Keep the rover **stationary** for ~2 s at power-on while gyro bias calibrates.
+If turns integrate the wrong way, change `GYRO_SIGN` in the sketch.
+
 ## Quick wiring checklist
 
 - [ ] Motor driver control pins on D5/D6/D9/D10
@@ -70,3 +87,4 @@ UNO Q D11 (PWM)     ---> servo signal
 - [ ] ECHO not on D3
 - [ ] Servo powered externally, common ground
 - [ ] UNO Q on stable 5 V / 3 A supply
+- [ ] MPU6050 on 3.3 V, SDA=A4, SCL=A5, common ground (if fitted)

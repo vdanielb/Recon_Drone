@@ -38,7 +38,7 @@ PAGE = r"""<!doctype html>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <title>DARKMAP-Q</title>
   <style>
-    @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+    /* Offline-first: no web-font CDN. Falls back to system + monospace stacks. */
 
     :root {
       --bg:       #080c10;

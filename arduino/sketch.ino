@@ -202,7 +202,8 @@ long clampDistance(long distanceCm) {
     return DIST_MIN_CM;
   }
   if (distanceCm > DIST_MAX_CM) {
-    return DIST_MAX_CM;
+    // Out of range: report invalid rather than a fake wall at DIST_MAX_CM.
+    return -1;
   }
   return distanceCm;
 }

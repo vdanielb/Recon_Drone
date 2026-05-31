@@ -51,7 +51,13 @@ the field order without updating both sides.
 SCAN,timestamp_ms,angle_deg,distance_cm,mode
 MOVE,timestamp_ms,action,duration_ms,speed
 STATE,timestamp_ms,mode,message
+HEADING,timestamp_ms,yaw_deg
 ```
+
+`HEADING` is **additive** (optional). When present, `yaw_deg` is CCW-positive
+degrees in [-180, 180] from the MPU6050 gyro; `main.py` sets `mapper.pose.theta`
+and skips turn dead-reckoning on subsequent `MOVE` packets. Older parsers ignore
+unknown line types.
 
 Valid `action` values: `FORWARD`, `BACKWARD`, `TURN_LEFT`, `TURN_RIGHT`, `STOP`.
 Valid `mode` values: `AUTO`, `MANUAL`, `SCAN_ONLY`, `WALLFOLLOW`, `STOP`.
@@ -75,8 +81,9 @@ Valid `mode` values: `AUTO`, `MANUAL`, `SCAN_ONLY`, `WALLFOLLOW`, `STOP`.
 The primary room-mapping mode. The rover:
 
 1. **Acquisition phase** — drives straight forward until a wall is within
-   `WF_CORNER_THRESHOLD_CM`, then turns 90° (`turnLeft()` call) to reorient so
-   the wall becomes the **left-side** reference, then nudges forward to clear
+   `WF_CORNER_THRESHOLD_CM`, then turns 90° (`turnByAngle(+WF_TURN_ANGLE_DEG)`
+   when IMU is present, else timed `turnLeft`) to reorient so the wall becomes
+   the **left-side** reference, then nudges forward to clear
    the corner. Emits `STATE,...,WALLFOLLOW,wf_acquired` on transition.
 2. **Following phase** — keeps the left wall at `TARGET_WALL_CM` using a
    five-case decision loop every step. The wall is sensed entirely from the
@@ -97,12 +104,14 @@ edge.
 (following). The Python simulator mirrors this with an internal `_acquired` flag
 in `WallFollowSimSource`.
 
-### Wall-following constants (all in `sketch.ino`)
+### Wall-following constants (in `working.ino` / `sketch.ino`)
 
 | Constant | Default | Notes |
 |---|---|---|
-| `WF_TURN90_MS` | 600 ms | Duration of a ~90° in-place turn. **Calibrate on real hardware.** |
-| `TURN_PULSE_MS` | 100 ms | Half used for nudge corrections (`TURN_PULSE_MS / 2`) |
+| `WF_TURN_ANGLE_DEG` | 90 | Exact corner/acquisition turn (gyro closed-loop in `working.ino`) |
+| `NUDGE_ANGLE_DEG` | 12 | Exact small drift-correction turn (replaces timed half-pulses) |
+| `WF_TURN90_MS` | 500 ms | **IMU fallback only** — timed ~90° when MPU6050 absent |
+| `TURN_PULSE_MS` | 100 ms | Legacy; nudges use `NUDGE_ANGLE_DEG` in `working.ino` |
 | `FORWARD_PULSE_MS` | 300 ms | Step distance per action |
 | `TARGET_WALL_CM` | 45 cm | Desired gap to the left wall |
 | `WALL_TOLERANCE_CM` | 15 cm | Dead band; widen to reduce oscillation |
@@ -133,6 +142,10 @@ outer-corner turns.
 - Serial is opened at 115200 baud. The Linux side must match.
 - `wf_acquired` is a global bool reset every time `WALLFOLLOW` mode is entered.
   It tracks whether the rover has found its first wall (Phase 1 vs Phase 2).
+- **MPU6050** (I2C `SDA=A4`, `SCL=A5` on `working.ino`): power at **3.3 V** only.
+  Boot requires the rover to be **stationary** for gyro bias calibration (~2 s).
+  Flip `GYRO_SIGN` if left turns integrate the wrong direction. If WHO_AM_I fails,
+  firmware sets `imuOk=false` and uses timed turns only.
 
 ---
 
@@ -144,8 +157,9 @@ outer-corner turns.
 - `mapper.py` owns all state: `Pose`, `obstacle_points`, `path_points`. Do not
   maintain duplicate pose state in other files.
 - Calibration constants (`SPEED_CM_PER_SEC`, `TURN_DEG_PER_SEC`) are in
-  `mapper.py`. Tune these against the real rover; do not change defaults without
-  testing.
+  `mapper.py`. Tune forward speed against the real rover. When `HEADING` packets
+  arrive, `TURN_DEG_PER_SEC` is unused for pose (gyro owns heading); without IMU,
+  turn rate still matters for map accuracy.
 - `serial_bridge.py` telemetry sources are independent of the rest of the
   pipeline. Adding a new source means subclassing `TelemetrySource` and
   registering it in `make_source()`.
@@ -186,15 +200,16 @@ every 500 ms. Do not change field names without updating both sides.
   "detections":       [{"ts","category","label","conf","distance_cm","x","y","note"}, ...],
   "detection_tags":   [{"x","y","category","label","conf","note"}, ...],
   "detection_counts": {"human": 2, "bag": 1, ...},
-  "detector":         {"enabled": true, "available": true, "model": "yolov8n.pt", "camera": 0, "fps": 3.1, "backend": "ultralytics", "error": null}
+  "detector":         {"enabled": true, "available": true, "model": "yolov8n.pt", "camera": 0, "fps": 3.1, "backend": "ultralytics", "error": null},
+  "imu":              {"enabled": true, "yaw_deg": 90.0, "ok": true}
 }
 ```
 
 `events` is capped at 20 entries server-side. The dashboard accumulates all
 events client-side across polls (deduplicated by `ts|msg`, newest first).
 
-The `detection_*` and `detector` fields are **additive** — they are always
-written (empty/false when detection is off) and older consumers that ignore
+The `detection_*`, `detector`, and `imu` fields are **additive** — they are always
+written (empty/false when detection/IMU is off) and older consumers that ignore
 them keep working. `detection_tags` is capped at ~200 for the map.
 
 ---
@@ -337,7 +352,7 @@ python3 main.py --source file --file ../data/logs/session_XXXX.csv
 
 ### A passing test produces
 
-- A `data/logs/session_*.csv` with SCAN/MOVE/STATE lines
+- A `data/logs/session_*.csv` with SCAN/MOVE/STATE lines (and HEADING when IMU/sim active)
 - A `data/logs/points_*.csv` with obstacle + path points
 - A `data/logs/map.png` showing walls and a rover path that traces the perimeter
 - A `data/logs/status.json` with the final telemetry snapshot
@@ -352,15 +367,20 @@ When moving from simulation to real hardware, calibrate in this order:
 1. **Pin assignments** — verify `#define` blocks in the sketch match your wiring
 2. **`SERVO_CENTER`** (default 90) — sensor should point straight ahead
 3. **`BASE_SPEED` / `TURN_SPEED`** (default 120) — start slow (~80–100 PWM)
-4. **`WF_TURN90_MS`** (default 700 ms) — mark 90° on floor, turn in place, adjust
-5. **`TURN_PULSE_MS`** / **`FORWARD_PULSE_MS`** — step size and nudge intensity
-6. **Wall-follow thresholds** — test in a square room; adjust `TARGET_WALL_CM`,
+4. **MPU6050** — wire `VCC` to 3.3 V, `SDA→A4`, `SCL→A5`, common GND; rover
+   still at boot for bias cal; verify `STATE imu_ready`; flip `GYRO_SIGN` if turns
+   read backward
+5. **`WF_TURN_ANGLE_DEG` / `NUDGE_ANGLE_DEG`** — corner and nudge angles are
+   gyro-exact in `working.ino`; only adjust if corners overshoot/undershoot
+6. **`WF_TURN90_MS`** — **only if IMU absent**; timed fallback for ~90° turns
+7. **`FORWARD_PULSE_MS`** — step distance per action
+8. **Wall-follow thresholds** — test in a square room; adjust `TARGET_WALL_CM`,
    `WF_CORNER_THRESHOLD_CM`, `WF_OPEN_THRESHOLD_CM` for your room size
-7. **`SPEED_CM_PER_SEC`** in `mapper.py` — measure real forward speed
-8. **`TURN_DEG_PER_SEC`** in `mapper.py` — measure real turn rate
+9. **`SPEED_CM_PER_SEC`** in `mapper.py` — measure real forward speed
+10. **`TURN_DEG_PER_SEC`** in `mapper.py` — only when no `HEADING` packets (no IMU)
 
-If `SPEED_CM_PER_SEC` or `TURN_DEG_PER_SEC` are wrong the obstacle map will
-look rotated or sheared even when navigation is correct.
+If `SPEED_CM_PER_SEC` is wrong the path scale drifts. Without `HEADING`, wrong
+`TURN_DEG_PER_SEC` shears the map; with IMU, heading comes from gyro telemetry.
 
 ---
 
@@ -393,3 +413,4 @@ look rotated or sheared even when navigation is correct.
    Common ground with the UNO Q.
 4. The UNO Q needs a stable 5V / 3A USB-C supply. Under-powered boards reset
    when motors spin.
+5. MPU6050 **VCC must be 3.3 V** (not 5 V). I2C on A4/A5; common ground with UNO Q.

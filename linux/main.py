@@ -72,6 +72,9 @@ def parse_line(line: str):
         if kind == "STATE" and len(parts) >= 4:
             # STATE,timestamp_ms,mode,message
             return ("STATE", parts[2], parts[3])
+        if kind == "HEADING" and len(parts) >= 3:
+            # HEADING,timestamp_ms,yaw_deg
+            return ("HEADING", float(parts[2]))
     except (ValueError, IndexError):
         return None
     return None
@@ -166,6 +169,11 @@ def run(args: argparse.Namespace) -> int:
                     "detection_counts": detection_counts,
                     "detector": detector.stats() if detector is not None
                     else {"enabled": False, "available": False},
+                    "imu": {
+                        "enabled": mapper._imu_heading,
+                        "yaw_deg": imu_yaw_deg,
+                        "ok": mapper._imu_heading,
+                    },
                 }, fh)
         except OSError:
             pass
@@ -175,6 +183,7 @@ def run(args: argparse.Namespace) -> int:
 
     current_mode = "STOP"
     current_scene = "UNKNOWN"
+    imu_yaw_deg: Optional[float] = None
     scan_since_classify = 0
     sweeps_since_png = 0
 
@@ -292,6 +301,12 @@ def run(args: argparse.Namespace) -> int:
                     write_status(current_mode)
                     if live:
                         live.notify()
+
+                elif kind == "HEADING":
+                    _, yaw = parsed
+                    imu_yaw_deg = yaw
+                    mapper.set_heading(yaw)
+                    write_status(current_mode)
 
                 elif kind == "STATE":
                     _, mode, message = parsed
