@@ -34,6 +34,9 @@ SPEED_CM_PER_SEC = 23.0   # forward speed estimate
 # 180.0 deg/s: ~90 deg per 500 ms in-place turn -> 90 / 0.5 = 180.
 TURN_DEG_PER_SEC = 180.0  # in-place turn rate estimate
 
+# Snap obstacle points to a 2 cm grid to dedup (ToF precision).
+OBSTACLE_BIN_CM = 2.0
+
 # Recon detection category -> marker color (shared concept with the dashboard).
 CATEGORY_COLORS = {
     "human":       "#ff5470",
@@ -67,6 +70,7 @@ class Mapper:
     detection_tags: List[dict] = field(default_factory=list)
     # When True, HEADING packets own theta; skip turn dead-reckoning on MOVE.
     _imu_heading: bool = field(default=False, repr=False)
+    _obstacle_cells: set = field(default_factory=set, repr=False)
 
     def __post_init__(self) -> None:
         # Seed the path with the starting position.
@@ -123,7 +127,10 @@ class Mapper:
         world_angle = self.pose.theta + math.radians(angle_deg)
         px = self.pose.x + distance_cm * math.cos(world_angle)
         py = self.pose.y + distance_cm * math.sin(world_angle)
-        self.obstacle_points.append((px, py))
+        cell = (round(px / OBSTACLE_BIN_CM), round(py / OBSTACLE_BIN_CM))
+        if cell not in self._obstacle_cells:
+            self._obstacle_cells.add(cell)
+            self.obstacle_points.append((px, py))
         return True
 
     # ----- detection tags (camera + YOLO) ----------------------------------

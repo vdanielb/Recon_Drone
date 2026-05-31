@@ -26,6 +26,13 @@ import time
 from typing import Iterator, Optional
 
 
+# VL53L4CD (Modulino Distance) sim model — mirrors firmware DIST_MAX_CM.
+TOF_MAX_CM = 130.0     # usable range cap (~1-130 cm)
+TOF_MIN_CM = 2.0
+TOF_NOISE_CM = 0.7     # ~+/-7 mm accuracy
+TOF_MISS_PROB = 0.01   # occasional dropped frame
+
+
 class TelemetrySource:
     """Base class. Subclasses implement ``lines()`` yielding text lines."""
 
@@ -250,10 +257,10 @@ class SimSource(TelemetrySource):
             if t > 0:
                 best = min(best, t)
         # Add a little sensor noise; occasionally drop a reading (-1).
-        if self.rng.random() < 0.04:
+        if self.rng.random() < TOF_MISS_PROB:
             return -1.0
-        noisy = best + self.rng.uniform(-3.0, 3.0)
-        if noisy < 3 or noisy > 250:
+        noisy = best + self.rng.uniform(-TOF_NOISE_CM, TOF_NOISE_CM)
+        if noisy < TOF_MIN_CM or noisy > TOF_MAX_CM:
             return -1.0
         return noisy
 
@@ -417,7 +424,7 @@ def _room_edges(vertices: list) -> list:
 
 def _ray_wall_distance(ox: float, oy: float, world_angle: float,
                        edges: list, noise_rng: random.Random,
-                       max_cm: float = 250.0) -> float:
+                       max_cm: float = TOF_MAX_CM) -> float:
     """Cast a ray from (ox, oy) at world_angle and return cm to nearest wall.
 
     Returns -1.0 on sensor miss (4 % probability) or when nothing is hit.
@@ -439,10 +446,10 @@ def _ray_wall_distance(ox: float, oy: float, world_angle: float,
 
     if best_t is None:
         return -1.0
-    if noise_rng.random() < 0.04:
+    if noise_rng.random() < TOF_MISS_PROB:
         return -1.0
-    noisy = best_t + noise_rng.uniform(-2.0, 2.0)
-    if noisy < 3.0 or noisy > max_cm:
+    noisy = best_t + noise_rng.uniform(-TOF_NOISE_CM, TOF_NOISE_CM)
+    if noisy < TOF_MIN_CM or noisy > max_cm:
         return -1.0
     return noisy
 
