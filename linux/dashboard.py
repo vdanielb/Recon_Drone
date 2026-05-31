@@ -649,7 +649,7 @@ function pickGridStep(sc) {
 // ─────────────────────────────────────────────────────────────────────────────
 // Radar drawing
 // ─────────────────────────────────────────────────────────────────────────────
-const RADAR_MAX = 120;
+const RADAR_MAX = 130;
 
 function drawRadar(lastScan) {
   const canvas = document.getElementById("radarCanvas");

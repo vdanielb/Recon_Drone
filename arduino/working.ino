@@ -3,6 +3,7 @@
 #include <Servo.h>
 #include <Wire.h>
 #include <math.h>
+#include <Modulino.h>
 #include <Arduino_RouterBridge.h>
 
 // Elegoo V4 motor pins (TB6612 shield)
@@ -13,20 +14,19 @@
 #define STBY 3
 #define BUTTON_PIN 2   // active-LOW: idles HIGH, reads LOW when pressed
 
-// Servo-mounted HC-SR04
+// Servo-mounted Modulino Distance (VL53L4CD ToF, I2C 0x29 on Qwiic / Wire1)
 #define SERVO_PIN 10
 #define SERVO_CENTER 90   // degrees — sensor points forward
-#define TRIG 13           // direct connection OK (3.3V output)
-#define ECHO 12           // MUST come through a 5V->3.3V voltage divider
 
 // Wall-following tuning — calibrate on real hardware
 const int WF_TURN90_MS           = 500;
 const int TURN_PULSE_MS          = 100;
 const int FORWARD_PULSE_MS       = 300;
-const int TARGET_WALL_CM         = 45;
+const int TARGET_WALL_CM         = 30; // Desired gap to the left wall +- WALL_TOLERANCE_CM
 const int WALL_TOLERANCE_CM      = 15;
-const int WF_CORNER_THRESHOLD_CM = 25;
-const int WF_OPEN_THRESHOLD_CM   = 50;
+const int WF_CORNER_THRESHOLD_CM = 15; // How close something in front can get before a left pivot (inner corner / acquisition)
+const int WF_OPEN_THRESHOLD_CM   = 45; // left distance that counts as "wall lost" → triggers an outer-corner turn right.
+// WF_OPEN_THRESHOLD_CM must stay above TARGET_WALL_CM + WALL_TOLERANCE_CM.
 const int BASE_SPEED             = 120;
 const int TURN_SPEED             = 120;
 
@@ -36,14 +36,16 @@ const float GYRO_SENS              = 131.0f;  // LSB/(deg/s) at +/-250 deg/s
 const int GYRO_SIGN                = 1;       // flip to -1 if left turn reads negative
 const int WF_TURN_ANGLE_DEG        = 90;
 const int NUDGE_ANGLE_DEG          = 12;
+// Cut motors this many degrees early so coast/momentum lands near target.
+const float TURN_LEAD_DEG          = 10.0f;
 const unsigned long TURN_TIMEOUT_MS = 3000UL;
 const int GYRO_BIAS_SAMPLES        = 1000;
 
-// Ultrasonic limits
-const unsigned long ECHO_TIMEOUT_US = 25000UL;  // ~4.3 m round-trip cap
-const long DIST_MIN_CM = 3;
-const long DIST_MAX_CM = 250;
-const int SERVO_SETTLE_MS = 80;
+// ToF limits (VL53L4CD: 0–1200 mm usable, clamp to 130 cm for mapping)
+const long DIST_MIN_CM = 2;
+const long DIST_MAX_CM = 130;
+const int SERVO_SETTLE_MS = 60;
+const unsigned long TOF_READ_TIMEOUT_MS = 40;  // ~2 ranging cycles
 
 // Button debounce
 const unsigned long DEBOUNCE_MS = 40;
@@ -59,6 +61,8 @@ const int SCAN_ANGLES[] = {-75, -45, -20, 0, 20, 45, 75};
 const int SCAN_COUNT = 7;
 
 Servo scanServo;
+ModulinoDistance tofSensor;
+bool tofOk = false;
 
 String currentMode = "STOP";
 bool wf_acquired = false;
@@ -117,6 +121,10 @@ void emitState(const char *message) {
 }
 
 void emitHeading();
+
+void emitTofStatus() {
+  emitState(tofOk ? "tof_ready" : "tof_absent");
+}
 
 void setMode(const String &mode) {
   if (currentMode == mode) {
@@ -286,7 +294,11 @@ void turnByAngle(float deltaDeg) {
   }
 
   float startYaw = yawDeg;
-  float target = fabs(deltaDeg);
+  // Stop early by the lead angle to pre-empt coast; never below zero.
+  float target = fabs(deltaDeg) - TURN_LEAD_DEG;
+  if (target < 0.0f) {
+    target = 0.0f;
+  }
   if (deltaDeg >= 0.0f) {
     setLeftSpin();
   } else {
@@ -329,33 +341,8 @@ void turnRight(int durationMs) {
 }
 
 // ---------------------------------------------------------------------------
-// Ultrasonic sensing
+// ToF distance sensing (Modulino Distance / VL53L4CD)
 // ---------------------------------------------------------------------------
-
-long readDistanceRawCM() {
-  digitalWrite(TRIG, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG, LOW);
-
-  unsigned long t0 = micros();
-  while (digitalRead(ECHO) == LOW) {
-    if (micros() - t0 > ECHO_TIMEOUT_US) {
-      return -1;
-    }
-  }
-
-  unsigned long echoStart = micros();
-  while (digitalRead(ECHO) == HIGH) {
-    if (micros() - echoStart > ECHO_TIMEOUT_US) {
-      return -1;
-    }
-  }
-  unsigned long dur = micros() - echoStart;
-
-  return (long)(dur * 0.0343 / 2.0);
-}
 
 long clampDistance(long distanceCm) {
   if (distanceCm < 0) {
@@ -371,20 +358,21 @@ long clampDistance(long distanceCm) {
   return distanceCm;
 }
 
-long medianOf3(long a, long b, long c) {
-  if (a > b) { long t = a; a = b; b = t; }
-  if (b > c) { long t = b; b = c; c = t; }
-  if (a > b) { long t = a; a = b; b = t; }
-  return b;
-}
-
 long readDistanceCM() {
-  long r1 = readDistanceRawCM();
-  delay(5);
-  long r2 = readDistanceRawCM();
-  delay(5);
-  long r3 = readDistanceRawCM();
-  return clampDistance(medianOf3(r1, r2, r3));
+  if (!tofOk) {
+    return -1;
+  }
+  unsigned long t0 = millis();
+  while (millis() - t0 < TOF_READ_TIMEOUT_MS) {
+    if (tofSensor.available()) {
+      float mm = tofSensor.get();
+      if (isnan(mm)) {
+        return -1;
+      }
+      return clampDistance((long)(mm / 10.0f + 0.5f));
+    }
+  }
+  return -1;
 }
 
 long scanAtAngle(int telemetryDeg) {
@@ -588,12 +576,16 @@ void setup() {
   digitalWrite(STBY, HIGH);
 
   pinMode(BUTTON_PIN, INPUT);
-  pinMode(TRIG, OUTPUT);
-  pinMode(ECHO, INPUT);
-  digitalWrite(TRIG, LOW);
 
   scanServo.attach(SERVO_PIN);
   scanServo.write(SERVO_CENTER);
+
+  // Modulino Distance is on the Qwiic connector, which is a separate I2C bus
+  // (Wire1) from the A4/A5 pins (Wire) used by the MPU6050. Use the library
+  // default bus for Qwiic.
+  Modulino.begin();
+  tofOk = tofSensor.begin();
+  emitTofStatus();
 
   imuOk = mpuInit();
   calibrateGyroBias();
