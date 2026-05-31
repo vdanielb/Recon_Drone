@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""UNO Q board-side telemetry relay for DARKMAP-Q.
-PUT THIS IN MAIN.PY ON THE ARDUINO
+"""UNO Q board-side telemetry relay for DARKMAP-Q (legacy fallback).
 
-Runs on the Arduino UNO Q Linux side inside Arduino App Lab (paired with
-``arduino/working.ino`` on the MCU).  The sketch pushes CSV lines via
-``Bridge.notify("telemetry", ...)``; this script receives them and forwards
-each line over TCP to the laptop running ``main.py --source net``.
+**Primary deployment:** use ``main.py`` (the App Lab entrypoint) instead — it
+runs mapping, edge YOLO, and the dashboard on the board; the laptop is only a
+browser client.
+
+This forwarder remains for the old laptop-hosted topology: MCU → Bridge → TCP →
+laptop ``pipeline.py --source net``.
+
+Runs on the Arduino UNO Q Linux side inside Arduino App Lab (paired with the MCU
+sketch).  The sketch pushes CSV lines via ``Bridge.notify("telemetry", ...)``;
+this script receives them and forwards each line over TCP to the laptop.
 
 Join the laptop's Wi-Fi hotspot first (see ``join_hotspot.sh``).  The default
 target is the Windows Mobile Hotspot gateway (``192.168.137.1``).  Override only
@@ -14,7 +19,7 @@ if your laptop uses a different subnet:
     export DARKMAP_LAPTOP_HOST=192.168.137.1  # default; Windows hotspot gateway
     export DARKMAP_LAPTOP_PORT=9009           # must match --listen-port
 
-Do **not** run this on the laptop — use ``main.py --source net`` there instead.
+Do **not** run this on the laptop — use ``pipeline.py --source net`` there instead.
 """
 
 from __future__ import annotations
@@ -29,7 +34,7 @@ try:
 except ImportError as exc:  # pragma: no cover - only available on UNO Q
     raise SystemExit(
         "uno_q_forwarder.py must run on the UNO Q via Arduino App Lab.\n"
-        "On the laptop use: python3 main.py --source net"
+        "On the laptop use: python3 pipeline.py --source net"
     ) from exc
 
 # Windows Mobile Hotspot always uses 192.168.137.1 (ICS gateway).

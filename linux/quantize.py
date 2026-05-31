@@ -23,7 +23,7 @@ with negligible accuracy loss for person detection.
 Deploy to the UNO Q
 -------------------
     scp linux/models/yolov8n_int8.onnx arduino@uno-q:~/darkmap/
-    python3 main.py --source serial --model ~/darkmap/yolov8n_int8.onnx
+    python3 pipeline.py --source bridge --model ~/darkmap/yolov8n_int8.onnx
 """
 
 from __future__ import annotations
@@ -165,7 +165,7 @@ def main(argv=None) -> int:
     print(f"  FP32  {fp32_path}")
     print(f"  INT8  {int8_path}  <- deploy this to the UNO Q")
     print(f"\n  On the UNO Q (onnxruntime only, no ultralytics needed):")
-    print(f"  python3 main.py --source serial --model {int8_path}")
+    print(f"  python3 pipeline.py --source bridge --model {int8_path}")
     return 0
 
 

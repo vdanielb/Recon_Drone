@@ -6,19 +6,25 @@ STATE packets, updates a dead-reckoning pose estimate, builds a 2D obstacle
 map, logs the raw session to CSV, and optionally shows a live map. Runs fully
 offline - no cloud APIs.
 
+This is the mapping/orchestration module. On the UNO Q board it is launched by
+``main.py`` (the App Lab entrypoint); on a laptop run it directly.
+
 Examples
 --------
     # No hardware: synthetic 'rover in a box' demo with a live map
-    python3 main.py --source sim
+    python3 pipeline.py --source sim
 
     # No hardware, headless (CI / quick check), no plotting window
-    python3 main.py --source sim --no-plot
+    python3 pipeline.py --source sim --no-plot
 
     # Live rover over serial
-    python3 main.py --source serial --port /dev/ttyACM0
+    python3 pipeline.py --source serial --port /dev/ttyACM0
 
     # Replay a saved session log
-    python3 main.py --source file --file data/logs/session_XXXX.csv
+    python3 pipeline.py --source file --file data/logs/session_XXXX.csv
+
+    # UNO Q board (MCU telemetry via App Lab Bridge) — usually via main.py
+    python3 pipeline.py --source bridge --no-plot --model models/yolov8n_int8.onnx
 """
 
 from __future__ import annotations
@@ -364,10 +370,12 @@ def run(args: argparse.Namespace) -> int:
 def build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="DARKMAP-Q offline mapping app")
     p.add_argument("--source", default="sim",
-                   choices=["serial", "file", "stdin", "sim", "wallsim", "net"],
+                   choices=["serial", "file", "stdin", "sim", "wallsim", "net",
+                            "bridge"],
                    help="telemetry source (default: sim); "
                         "use 'wallsim' to simulate WALLFOLLOW; "
-                        "use 'net' for WiFi TCP from the UNO Q board")
+                        "use 'bridge' on UNO Q App Lab (MCU via Bridge); "
+                        "use 'net' for WiFi TCP from the UNO Q board (legacy)")
     p.add_argument("--port", default=None,
                    help="serial port (e.g. /dev/ttyACM0); auto-detect if omitted")
     p.add_argument("--listen-host", default="0.0.0.0",

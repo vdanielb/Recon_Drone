@@ -1,6 +1,6 @@
 # DARKMAP-Q Linux/MPU side dependencies
 #
-# Core mapping pipeline (main.py + mapper.py):
+# Core mapping pipeline (pipeline.py + mapper.py; main.py is the UNO Q entry):
 matplotlib>=3.5
 
 # Live rover over a serial port (serial_bridge.py SerialSource).

@@ -9,46 +9,46 @@ obstacles autonomously, and an onboard Linux process builds a rough 2D map.
 
 ## Quick start (live run over Wi-Fi, no router, no internet)
 
-Telemetry streams from the board to the laptop over the laptop's own Wi-Fi
-hotspot. Roles: the laptop is the Wi-Fi host **and** the TCP server; the UNO Q
-joins the hotspot and connects out to it.
+**Primary (board-hosted dashboard):** mapping, edge YOLO, and the Flask UI run
+on the UNO Q. The laptop only joins the hotspot and opens a browser.
 
-**1. Laptop - turn on the hotspot (one time):**
-- Settings -> Network & Internet -> Mobile hotspot -> On (set an SSID/password,
-  share over Wi-Fi). The laptop becomes `192.168.137.1`.
-- Allow the telemetry port through the firewall (admin PowerShell, one time):
-  ```powershell
-  netsh advfirewall firewall add rule name="DARKMAP net 9009" dir=in action=allow protocol=TCP localport=9009
-  ```
+**1. Laptop — turn on the hotspot (one time):**
+- Settings → Network & Internet → Mobile hotspot → On (laptop gateway
+  `192.168.137.1`).
 
-**2. UNO Q - join the hotspot (one time):**
+**2. UNO Q — join the hotspot (one time):**
 ```bash
-./linux/join_hotspot.sh "<SSID>" "<PASSWORD>"   # should print gateway 192.168.137.1
+./linux/join_hotspot.sh "<SSID>" "<PASSWORD>"
 ```
 
-**3. Laptop - start the receiver (headless; dashboard provides the view):**
-```powershell
-cd linux
-python main.py --source net --no-plot
-```
+**3. UNO Q — deploy and run App Lab:**
+- Copy `linux/` to the board (include `models/yolov8n_int8.onnx`).
+- The App Lab Python main is `linux/main.py` (board entrypoint: MCU sketch +
+  Bridge telemetry + dashboard). It launches `pipeline.py --source bridge`.
+- `pip install Flask matplotlib opencv-python onnxruntime` on the board.
 
-**4. Laptop - start the offline dashboard (second terminal):**
+**4. Laptop — open the dashboard:**
+- Find the board IP (e.g. `192.168.137.x` from the board shell).
+- Browser: `http://<board-ip>:8000` (map, radar, camera, detections).
+
+**5. Press the rover's button** to enter `WALLFOLLOW`. Press again to STOP.
+
+<details>
+<summary>Legacy: laptop runs pipeline.py + dashboard (TCP relay)</summary>
+
+Allow port 9009 on the laptop firewall, then:
+
 ```powershell
 cd linux
+python pipeline.py --source net --no-plot
 python dashboard.py
 ```
-Open http://127.0.0.1:8000 (add `--host 0.0.0.0` to view from a phone on the
-hotspot at http://192.168.137.1:8000).
 
-**5. UNO Q - run the rover:** launch the App Lab project (`arduino/working.ino`
-on the MCU + `linux/uno_q_forwarder.py` on the Linux side). When connected the
-laptop prints `[net] client connected from 192.168.137.x`.
-
-**6. Press the rover's button** to enter `WALLFOLLOW`. Telemetry starts flowing
-and the map fills in. Press again to STOP.
+On the UNO Q use `linux/uno_q_forwarder.py` instead of `main.py`.
+</details>
 
 > No hardware? Skip steps 1-2 and 5-6 and run the simulator instead:
-> `python main.py --source wallsim --room square:300 --sim-steps 300` (then open
+> `python pipeline.py --source wallsim --room square:300 --sim-steps 300` (then open
 > the dashboard).
 
 ## Problem
@@ -92,9 +92,9 @@ flowchart LR
   end
   subgraph LIN [Linux MPU - Python]
     bridge[serial_bridge.py]
-    app[main.py]
+    app[pipeline.py]
     map[mapper.py]
-    dash[dashboard.py optional]
+    dash[dashboard.py]
     bridge --> app --> map --> dash
   end
   auto -->|"CSV: SCAN / MOVE / STATE / HEADING"| bridge
@@ -114,13 +114,15 @@ HEADING,timestamp_ms,yaw_deg                    # optional; MPU6050 gyro (CCW-po
 
 ```text
 arduino/darkmap_rover.ino   MCU sketch (motors, servo, ultrasonic, autonomy, telemetry)
-linux/serial_bridge.py      Telemetry sources: serial / file / stdin / built-in simulator
+linux/serial_bridge.py      Telemetry sources: serial / file / stdin / sim / wallsim / bridge / net
 linux/mapper.py             Pose dead-reckoning, scan->XY, live map, detection tags, PNG/CSV export
-linux/main.py               Orchestrator: parse packets, log, map, scene tag, fuse detections
+linux/pipeline.py           Orchestrator: parse packets, log, map, scene tag, fuse detections
+linux/main.py               UNO Q App Lab entrypoint: bridge telemetry + edge YOLO + dashboard
+linux/uno_q_forwarder.py    Legacy: Bridge -> TCP to laptop pipeline.py --source net
 linux/scene.py              Rule-based scene classification (edge logic)
 linux/detector.py           Camera + YOLO recon object detection (offline, optional)
 linux/test_detector.py      Standalone webcam/model test for the detector
-linux/dashboard.py          Optional offline Flask dashboard
+linux/dashboard.py          Offline Flask dashboard (board-hosted or laptop)
 linux/requirements.txt      Python dependencies
 docs/                       wiring.md, demo_script.md, pitch.md
 data/logs/                  Session CSVs, points CSV, detections CSV, map.png (gitignored)
@@ -151,21 +153,24 @@ pip install -r requirements.txt   # matplotlib (+ pyserial for live, Flask for d
 No hardware? Use the built-in simulator (a virtual "rover in a box"):
 
 ```bash
-python3 main.py --source sim            # live 2D map window
-python3 main.py --source sim --no-plot  # headless; writes data/logs/map.png
+python3 pipeline.py --source sim            # live 2D map window
+python3 pipeline.py --source sim --no-plot  # headless; writes data/logs/map.png
 ```
 
 Live rover over serial:
 
 ```bash
-python3 main.py --source serial --port /dev/ttyACM0
+python3 pipeline.py --source serial --port /dev/ttyACM0
 ```
 
 Replay a saved session log:
 
 ```bash
-python3 main.py --source file --file ../data/logs/session_YYYYMMDD_HHMMSS.csv
+python3 pipeline.py --source file --file ../data/logs/session_YYYYMMDD_HHMMSS.csv
 ```
+
+> On the UNO Q board you don't run `pipeline.py` directly — App Lab runs
+> `main.py`, which launches `pipeline.py --source bridge` plus the dashboard.
 
 Each run writes to `data/logs/`:
 
@@ -208,13 +213,13 @@ python3 test_detector.py --once    # single frame then exit
 python3 test_detector.py --camera 1 --model yolov8n.pt --conf 0.5
 ```
 
-### Detection flags for `main.py`
+### Detection flags for `pipeline.py`
 
 ```bash
-python3 main.py --source serial --port /dev/ttyACM0          # detection auto-on
-python3 main.py --source sim --no-detect                     # disable detection
-python3 main.py --source serial --camera 1 --detect-conf 0.5 # tune camera/threshold
-python3 main.py --source serial --detect-cooldown 5          # secs between tags/category
+python3 pipeline.py --source serial --port /dev/ttyACM0          # detection auto-on
+python3 pipeline.py --source sim --no-detect                     # disable detection
+python3 pipeline.py --source serial --camera 1 --detect-conf 0.5 # tune camera/threshold
+python3 pipeline.py --source serial --detect-cooldown 5          # secs between tags/category
 ```
 
 ### Mission categories

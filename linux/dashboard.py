@@ -963,7 +963,7 @@ function updateUI(data) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Camera feed — always polls /api/camera/frame every 500 ms.
-// Works whether the camera runs via main.py or test_detector.py.
+// Works whether the camera runs via pipeline.py or test_detector.py.
 // ─────────────────────────────────────────────────────────────────────────────
 function _showCamFrame(src) {
   const img = document.getElementById("camImg");

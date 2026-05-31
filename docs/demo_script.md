@@ -23,21 +23,37 @@ Duration: 60-120 seconds
 - [ ] Internet OFF (or be ready to point out nothing uses the network)
 - [ ] Fallback manual mode tested (`m` then `i/j/k/l`)
 
-## Run order (live rover)
+## Run order (live rover — UNO Q primary)
 
 1. Power the UNO Q and the motor battery. Confirm `STATE,...,boot_ok` appears.
-2. On the laptop / UNO Q Linux side:
-   ```bash
-   cd linux
-   python3 main.py --source serial --port /dev/ttyACM0
-   ```
-3. Put the rover at the arena entrance.
-4. Send `a` (AUTO) over the serial monitor / console to start autonomy.
-5. The rover scans, steps forward when clear, stops and turns toward open space
-   when blocked. Obstacle points and the path appear live on the 2D map.
-6. After ~60-120 s, send `x` (STOP).
-7. Show the generated map (`data/logs/map.png`) and the session log CSV.
-8. Explain how the same sensing/mapping payload scales to UGVs or drones.
+2. On the board, run the Arduino App Lab project — its Python main is
+   `linux/main.py` (mapping + edge YOLO + dashboard all start on the board).
+3. Join the laptop Wi-Fi hotspot from the board; find the board IP
+   (e.g. `192.168.137.x`).
+4. On the laptop, open `http://<board-ip>:8000` — live map, radar, camera, detections.
+5. Put the rover at the arena entrance.
+6. Send `a` (AUTO) over the serial monitor / MCU console to start autonomy.
+7. After ~60-120 s, send `x` (STOP).
+8. Show the dashboard map and `data/logs/map.png` on the board (or copy logs off).
+9. Explain how the same sensing/mapping payload scales to UGVs or drones.
+
+### Legacy: laptop runs `pipeline.py` (TCP relay)
+
+If using `uno_q_forwarder.py` on the board instead of `main.py`:
+
+```bash
+# Laptop
+cd linux
+python3 pipeline.py --source net
+python3 dashboard.py   # optional; camera only if laptop has a webcam
+```
+
+### Direct serial (non–UNO Q or MCU exposed as `/dev/ttyACM0`)
+
+```bash
+cd linux
+python3 pipeline.py --source serial --port /dev/ttyACM0
+```
 
 ## What to say while it runs
 
@@ -54,16 +70,18 @@ telemetry and a real map so the mapping story still lands:
 
 ```bash
 cd linux
-python3 main.py --source sim          # live map window
+python3 pipeline.py --source sim          # live map window
 # or headless, then show the PNG:
-python3 main.py --source sim --no-plot
+python3 pipeline.py --source sim --no-plot
 ```
 
-Optionally show the local dashboard:
+Optionally show the local dashboard (sim writes `status.json` on the same machine):
 
 ```bash
 python3 dashboard.py        # then open http://127.0.0.1:8000
 ```
+
+For a live UNO Q run, open `http://<board-ip>:8000` instead (dashboard runs on the board).
 
 ## Fallback modes
 
@@ -79,5 +97,5 @@ python3 dashboard.py        # then open http://127.0.0.1:8000
 
 1. Send `x` to stop.
 2. Pick up the rover, place it back at the start.
-3. Restart `main.py` (a fresh session log + map are created each run).
+3. Restart the App Lab project / `pipeline.py` (a fresh session log + map are created each run).
 4. Send `a` to begin again.

@@ -12,13 +12,14 @@ All sources expose the same interface::
             handle(line)
 
 Everything here is offline and dependency-light. ``pyserial`` is only imported
-when a serial source is actually requested, so the simulator and file replay
-work even on machines without pyserial installed.
+when a serial source is actually requested; ``arduino.app_utils`` only when
+``bridge`` is requested — so simulators and file replay work on any machine.
 """
 
 from __future__ import annotations
 
 import math
+import queue
 import random
 import socket
 import sys
@@ -145,6 +146,55 @@ class StdinSource(TelemetrySource):
             line = raw.strip()
             if line:
                 yield line
+
+
+class BridgeSource(TelemetrySource):
+    """Receive CSV telemetry from the UNO Q MCU via Arduino App Lab Bridge.
+
+    The sketch emits ``Bridge.notify("telemetry", line)``; this source registers
+    ``Bridge.provide("telemetry", ...)`` and yields lines from a thread-safe queue.
+    Must run inside an App Lab process that calls ``App.run()`` on the main thread
+    (see ``main.py``, the UNO Q App Lab entrypoint).
+
+    Call ``BridgeSource()`` once on the main thread before ``App.run()`` so
+    ``Bridge.provide`` is registered before worker threads start; subsequent
+    instances share the same queue (``make_source("bridge")`` in the pipeline).
+    """
+
+    _shared: Optional["BridgeSource"] = None
+
+    def __init__(self) -> None:
+        if BridgeSource._shared is not None:
+            self._queue = BridgeSource._shared._queue
+            return
+
+        try:
+            from arduino.app_utils import Bridge  # type: ignore
+        except ImportError as exc:  # pragma: no cover - only on UNO Q
+            raise RuntimeError(
+                "Bridge source requires Arduino App Lab on the UNO Q. "
+                "Use --source serial, net, or sim on other hosts."
+            ) from exc
+
+        self._queue: queue.Queue[str] = queue.Queue()
+        Bridge.provide("telemetry", self._on_line)
+        BridgeSource._shared = self
+        print("[bridge] Bridge.provide('telemetry') registered; waiting for MCU data")
+
+    def _on_line(self, line: str) -> None:
+        if line and str(line).strip():
+            self._queue.put(str(line).strip())
+
+    def lines(self) -> Iterator[str]:
+        while True:
+            yield self._queue.get()
+
+    def close(self) -> None:
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
 
 
 class NetworkSource(TelemetrySource):
@@ -648,7 +698,7 @@ def make_source(kind: str, port: Optional[str] = None, file: Optional[str] = Non
                 room: Optional[str] = None,
                 listen_host: str = "0.0.0.0",
                 listen_port: int = 9009) -> TelemetrySource:
-    """Factory used by main.py to build the requested telemetry source."""
+    """Factory used by pipeline.py to build the requested telemetry source."""
     kind = (kind or "sim").lower()
     if kind == "serial":
         return SerialSource(port=port)
@@ -658,6 +708,8 @@ def make_source(kind: str, port: Optional[str] = None, file: Optional[str] = Non
         return FileSource(file, delay=delay)
     if kind == "stdin":
         return StdinSource()
+    if kind == "bridge":
+        return BridgeSource()
     if kind == "net":
         return NetworkSource(host=listen_host, port=listen_port)
     if kind == "sim":
