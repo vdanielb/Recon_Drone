@@ -1,4 +1,10 @@
+// last working sketch
+
 #include <Servo.h>
+#include <Wire.h>
+#include <math.h>
+#include <Modulino.h>
+#include <Arduino_RouterBridge.h>
 
 // Elegoo V4 motor pins (TB6612 shield)
 #define PWMA 5
@@ -8,34 +14,43 @@
 #define STBY 3
 #define BUTTON_PIN 2   // active-LOW: idles HIGH, reads LOW when pressed
 
-// Servo-mounted HC-SR04
+// Servo-mounted Modulino Distance (VL53L4CD ToF, I2C 0x29 on Qwiic / Wire1)
 #define SERVO_PIN 10
 #define SERVO_CENTER 90   // degrees — sensor points forward
-#define TRIG 13           // direct connection OK (3.3V output)
-#define ECHO 12           // MUST come through a 5V->3.3V voltage divider
 
 // Wall-following tuning — calibrate on real hardware
 const int WF_TURN90_MS           = 500;
 const int TURN_PULSE_MS          = 100;
-const int FORWARD_PULSE_MS       = 500;
-const int TARGET_WALL_CM         = 50; // Desired gap to the left wall +- WALL_TOLERANCE_CM
-const int WALL_TOLERANCE_CM      = 25;
-const int WF_CORNER_THRESHOLD_CM = 50; // How close something in front can get before a left pivot (inner corner / acquisition)
-const int WF_OPEN_THRESHOLD_CM   = 75; // left distance that counts as "wall lost" → triggers an outer-corner turn right.
+const int FORWARD_PULSE_MS       = 300;
+const int TARGET_WALL_CM         = 30; // Desired gap to the left wall +- WALL_TOLERANCE_CM
+const int WALL_TOLERANCE_CM      = 15;
+const int WF_CORNER_THRESHOLD_CM = 15; // How close something in front can get before a left pivot (inner corner / acquisition)
+const int WF_OPEN_THRESHOLD_CM   = 45; // left distance that counts as "wall lost" → triggers an outer-corner turn right.
 // WF_OPEN_THRESHOLD_CM must stay above TARGET_WALL_CM + WALL_TOLERANCE_CM.
 const int BASE_SPEED             = 120;
 const int TURN_SPEED             = 120;
 
-// Ultrasonic limits
-const unsigned long ECHO_TIMEOUT_US = 25000UL;  // ~4.3 m round-trip cap
-const long DIST_MIN_CM = 3;
-const long DIST_MAX_CM = 250;
-const int SERVO_SETTLE_MS = 80;
+// MPU6050 gyro (I2C: SDA=A4, SCL=A5) — exact turns + heading telemetry
+#define MPU_ADDR                 0x68
+const float GYRO_SENS              = 131.0f;  // LSB/(deg/s) at +/-250 deg/s
+const int GYRO_SIGN                = 1;       // flip to -1 if left turn reads negative
+const int WF_TURN_ANGLE_DEG        = 90;
+const int NUDGE_ANGLE_DEG          = 12;
+// Cut motors this many degrees early so coast/momentum lands near target.
+const float TURN_LEAD_DEG          = 10.0f;
+const unsigned long TURN_TIMEOUT_MS = 3000UL;
+const int GYRO_BIAS_SAMPLES        = 1000;
+
+// ToF limits (VL53L4CD: 0–1200 mm usable, clamp to 130 cm for mapping)
+const long DIST_MIN_CM = 2;
+const long DIST_MAX_CM = 130;
+const int SERVO_SETTLE_MS = 60;
+const unsigned long TOF_READ_TIMEOUT_MS = 40;  // ~2 ranging cycles
 
 // Button debounce
 const unsigned long DEBOUNCE_MS = 40;
 
-// Wall-follow debug telemetry (wf_decide STATE lines on Monitor)
+// Wall-follow debug telemetry (wf_decide STATE lines forwarded to laptop)
 #define DEBUG_WF 1
 
 // Staleness cap for last valid left-wall reading when side scan fails
@@ -46,6 +61,8 @@ const int SCAN_ANGLES[] = {-75, -45, -20, 0, 20, 45, 75};
 const int SCAN_COUNT = 7;
 
 Servo scanServo;
+ModulinoDistance tofSensor;
+bool tofOk = false;
 
 String currentMode = "STOP";
 bool wf_acquired = false;
@@ -65,6 +82,12 @@ long lastFrontDistCm = -1;
 long lastValidLeftCm = -1;
 unsigned long lastValidLeftMs = 0;
 
+// MPU6050 state (continuous unwrapped yaw for closed-loop turns)
+bool imuOk = false;
+float yawDeg = 0.0f;
+float gyroBiasZ = 0.0f;
+unsigned long lastYawUs = 0;
+
 // ---------------------------------------------------------------------------
 // Telemetry helpers
 // ---------------------------------------------------------------------------
@@ -77,35 +100,30 @@ int servoToTelemetry(int servoDeg) {
   return SERVO_CENTER - servoDeg;
 }
 
+// Push one CSV telemetry line to the UNO Q Linux side via Bridge RPC.
+void emitTelemetry(const String &line) {
+  Bridge.notify("telemetry", line.c_str());
+}
+
 void emitScan(int angleDeg, long distanceCm) {
-  Monitor.print("SCAN,");
-  Monitor.print(millis());
-  Monitor.print(",");
-  Monitor.print(angleDeg);
-  Monitor.print(",");
-  Monitor.print(distanceCm);
-  Monitor.print(",");
-  Monitor.println(currentMode);
+  emitTelemetry("SCAN," + String(millis()) + "," + String(angleDeg) + ","
+                + String(distanceCm) + "," + currentMode);
 }
 
 void emitMove(const char *action, int durationMs, int speed) {
-  Monitor.print("MOVE,");
-  Monitor.print(millis());
-  Monitor.print(",");
-  Monitor.print(action);
-  Monitor.print(",");
-  Monitor.print(durationMs);
-  Monitor.print(",");
-  Monitor.println(speed);
+  emitTelemetry("MOVE," + String(millis()) + "," + String(action) + ","
+                + String(durationMs) + "," + String(speed));
 }
 
 void emitState(const char *message) {
-  Monitor.print("STATE,");
-  Monitor.print(millis());
-  Monitor.print(",");
-  Monitor.print(currentMode);
-  Monitor.print(",");
-  Monitor.println(message);
+  emitTelemetry("STATE," + String(millis()) + "," + currentMode + ","
+                + String(message));
+}
+
+void emitHeading();
+
+void emitTofStatus() {
+  emitState(tofOk ? "tof_ready" : "tof_absent");
 }
 
 void setMode(const String &mode) {
@@ -127,6 +145,97 @@ void setMode(const String &mode) {
 }
 
 // ---------------------------------------------------------------------------
+// MPU6050 gyro (raw Wire — no external library)
+// ---------------------------------------------------------------------------
+
+void mpuWrite(uint8_t reg, uint8_t val) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(reg);
+  Wire.write(val);
+  Wire.endTransmission();
+}
+
+int16_t mpuReadGyroZ() {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x47);  // GYRO_ZOUT_H
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)2, (uint8_t)true);
+  if (Wire.available() < 2) {
+    return 0;
+  }
+  int16_t hi = Wire.read();
+  int16_t lo = Wire.read();
+  return (int16_t)((hi << 8) | lo);
+}
+
+bool mpuInit() {
+  Wire.begin();
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x75);  // WHO_AM_I
+  Wire.endTransmission(false);
+  Wire.requestFrom((uint8_t)MPU_ADDR, (uint8_t)1, (uint8_t)true);
+  if (Wire.available() < 1 || Wire.read() != 0x68) {
+    return false;
+  }
+  mpuWrite(0x6B, 0x00);  // wake
+  mpuWrite(0x1A, 0x03);  // DLPF ~44 Hz
+  mpuWrite(0x1B, 0x00);  // gyro +/-250 deg/s
+  delay(50);
+  lastYawUs = micros();
+  return true;
+}
+
+void calibrateGyroBias() {
+  if (!imuOk) {
+    emitState("imu_absent");
+    return;
+  }
+  emitState("imu_calibrating");
+  delay(500);
+  float sum = 0.0f;
+  for (int i = 0; i < GYRO_BIAS_SAMPLES; i++) {
+    sum += (float)mpuReadGyroZ();
+    delay(2);
+  }
+  gyroBiasZ = sum / (float)GYRO_BIAS_SAMPLES;
+  yawDeg = 0.0f;
+  lastYawUs = micros();
+  emitState("imu_ready");
+}
+
+void updateYaw() {
+  if (!imuOk) {
+    return;
+  }
+  unsigned long nowUs = micros();
+  float dt = (nowUs - lastYawUs) / 1000000.0f;
+  lastYawUs = nowUs;
+  if (dt <= 0.0f || dt > 0.5f) {
+    return;
+  }
+  float gz = (float)mpuReadGyroZ() - gyroBiasZ;
+  yawDeg += (float)GYRO_SIGN * (gz / GYRO_SENS) * dt;
+}
+
+float wrapYawDeg(float deg) {
+  while (deg > 180.0f) {
+    deg -= 360.0f;
+  }
+  while (deg < -180.0f) {
+    deg += 360.0f;
+  }
+  return deg;
+}
+
+void emitHeading() {
+  if (!imuOk) {
+    return;
+  }
+  emitTelemetry("HEADING," + String(millis()) + ","
+                + String(wrapYawDeg(yawDeg), 2));
+}
+
+// ---------------------------------------------------------------------------
 // Motor control
 // ---------------------------------------------------------------------------
 
@@ -135,14 +244,80 @@ void stopMotors() {
   analogWrite(PWMB, 0);
 }
 
+void setLeftSpin() {
+  digitalWrite(AIN1, LOW);
+  digitalWrite(BIN1, HIGH);
+  analogWrite(PWMA, TURN_SPEED);
+  analogWrite(PWMB, TURN_SPEED);
+}
+
+void setRightSpin() {
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(BIN1, LOW);
+  analogWrite(PWMA, TURN_SPEED);
+  analogWrite(PWMB, TURN_SPEED);
+}
+
+int fallbackTurnMs(float deltaDeg) {
+  return (int)((fabs(deltaDeg) / 90.0f) * (float)WF_TURN90_MS + 0.5f);
+}
+
 void driveForward(int durationMs) {
   digitalWrite(AIN1, HIGH);
   digitalWrite(BIN1, HIGH);
   analogWrite(PWMA, BASE_SPEED);
   analogWrite(PWMB, BASE_SPEED);
-  delay(durationMs);
+  unsigned long t0 = millis();
+  while (millis() - t0 < (unsigned long)durationMs) {
+    if (imuOk) {
+      updateYaw();
+    } else {
+      delay(1);
+    }
+  }
   stopMotors();
   emitMove("FORWARD", durationMs, BASE_SPEED);
+  if (imuOk) {
+    emitHeading();
+  }
+}
+
+void turnByAngle(float deltaDeg) {
+  if (!imuOk) {
+    int ms = fallbackTurnMs(deltaDeg);
+    if (deltaDeg >= 0.0f) {
+      turnLeft(ms);
+    } else {
+      turnRight(ms);
+    }
+    return;
+  }
+
+  float startYaw = yawDeg;
+  // Stop early by the lead angle to pre-empt coast; never below zero.
+  float target = fabs(deltaDeg) - TURN_LEAD_DEG;
+  if (target < 0.0f) {
+    target = 0.0f;
+  }
+  if (deltaDeg >= 0.0f) {
+    setLeftSpin();
+  } else {
+    setRightSpin();
+  }
+
+  unsigned long t0 = millis();
+  while (fabs(yawDeg - startYaw) < target && millis() - t0 < TURN_TIMEOUT_MS) {
+    updateYaw();
+  }
+  stopMotors();
+
+  unsigned long elapsed = millis() - t0;
+  if (deltaDeg >= 0.0f) {
+    emitMove("TURN_LEFT", (int)elapsed, TURN_SPEED);
+  } else {
+    emitMove("TURN_RIGHT", (int)elapsed, TURN_SPEED);
+  }
+  emitHeading();
 }
 
 void turnLeft(int durationMs) {
@@ -166,33 +341,8 @@ void turnRight(int durationMs) {
 }
 
 // ---------------------------------------------------------------------------
-// Ultrasonic sensing
+// ToF distance sensing (Modulino Distance / VL53L4CD)
 // ---------------------------------------------------------------------------
-
-long readDistanceRawCM() {
-  digitalWrite(TRIG, LOW);
-  delayMicroseconds(2);
-  digitalWrite(TRIG, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG, LOW);
-
-  unsigned long t0 = micros();
-  while (digitalRead(ECHO) == LOW) {
-    if (micros() - t0 > ECHO_TIMEOUT_US) {
-      return -1;
-    }
-  }
-
-  unsigned long echoStart = micros();
-  while (digitalRead(ECHO) == HIGH) {
-    if (micros() - echoStart > ECHO_TIMEOUT_US) {
-      return -1;
-    }
-  }
-  unsigned long dur = micros() - echoStart;
-
-  return (long)(dur * 0.0343 / 2.0);
-}
 
 long clampDistance(long distanceCm) {
   if (distanceCm < 0) {
@@ -208,20 +358,21 @@ long clampDistance(long distanceCm) {
   return distanceCm;
 }
 
-long medianOf3(long a, long b, long c) {
-  if (a > b) { long t = a; a = b; b = t; }
-  if (b > c) { long t = b; b = c; c = t; }
-  if (a > b) { long t = a; a = b; b = t; }
-  return b;
-}
-
 long readDistanceCM() {
-  long r1 = readDistanceRawCM();
-  delay(5);
-  long r2 = readDistanceRawCM();
-  delay(5);
-  long r3 = readDistanceRawCM();
-  return clampDistance(medianOf3(r1, r2, r3));
+  if (!tofOk) {
+    return -1;
+  }
+  unsigned long t0 = millis();
+  while (millis() - t0 < TOF_READ_TIMEOUT_MS) {
+    if (tofSensor.available()) {
+      float mm = tofSensor.get();
+      if (isnan(mm)) {
+        return -1;
+      }
+      return clampDistance((long)(mm / 10.0f + 0.5f));
+    }
+  }
+  return -1;
 }
 
 long scanAtAngle(int telemetryDeg) {
@@ -305,16 +456,9 @@ long resolveLeftDistance(long rawLeftCm, bool *rawValidOut) {
 #if DEBUG_WF
 void emitWfDecide(long frontCm, long leftCm, bool leftRawValid,
                   const char *branch) {
-  Monitor.print("STATE,");
-  Monitor.print(millis());
-  Monitor.print(",WALLFOLLOW,wf_decide,f=");
-  Monitor.print(frontCm);
-  Monitor.print(",l=");
-  Monitor.print(leftCm);
-  Monitor.print(",lv=");
-  Monitor.print(leftRawValid ? 1 : 0);
-  Monitor.print(",b=");
-  Monitor.println(branch);
+  emitTelemetry("STATE," + String(millis()) + ",WALLFOLLOW,wf_decide,f="
+                + String(frontCm) + ",l=" + String(leftCm) + ",lv="
+                + String(leftRawValid ? 1 : 0) + ",b=" + String(branch));
 }
 #endif
 
@@ -323,6 +467,10 @@ void emitWfDecide(long frontCm, long leftCm, bool leftRawValid,
 // ---------------------------------------------------------------------------
 
 void wallFollowStep() {
+  if (imuOk) {
+    updateYaw();
+    emitHeading();
+  }
   fullSweep();
 
   long frontRaw = lastFrontDistCm;
@@ -335,7 +483,7 @@ void wallFollowStep() {
   // so the wall sits on the left, then nudge forward to clear the corner.
   if (!wf_acquired) {
     if (frontRaw >= 0 && frontRaw <= WF_CORNER_THRESHOLD_CM) {
-      turnLeft(WF_TURN90_MS);
+      turnByAngle((float)WF_TURN_ANGLE_DEG);
       driveForward(FORWARD_PULSE_MS);
       wf_acquired = true;
       emitState("wf_acquired");
@@ -356,27 +504,27 @@ void wallFollowStep() {
   if (frontRaw >= 0 && frontRaw <= WF_CORNER_THRESHOLD_CM) {
     // Inner corner: something ahead. Turn away from the left wall.
     emitState("wf_corner");
-    turnLeft(WF_TURN90_MS);
+    turnByAngle((float)WF_TURN_ANGLE_DEG);
 #if DEBUG_WF
     emitWfDecide(frontRaw, left, leftRawValid, "inner");
 #endif
   } else if (leftRawValid && leftRaw > WF_OPEN_THRESHOLD_CM) {
     // Outer corner: left wall ended. Overshoot, then wrap toward the wall.
     driveForward(FORWARD_PULSE_MS);
-    turnRight(WF_TURN90_MS);
+    turnByAngle((float)(-WF_TURN_ANGLE_DEG));
 #if DEBUG_WF
     emitWfDecide(front, leftRaw, true, "outer");
 #endif
   } else if (left >= 0 && left > TARGET_WALL_CM + WALL_TOLERANCE_CM) {
     // Drifting away from the left wall: nudge back toward it.
-    turnRight(TURN_PULSE_MS / 2);
+    turnByAngle((float)(-NUDGE_ANGLE_DEG));
     driveForward(FORWARD_PULSE_MS);
 #if DEBUG_WF
     emitWfDecide(front, left, leftRawValid, "nudge_to_wall");
 #endif
   } else if (left >= 0 && left < TARGET_WALL_CM - WALL_TOLERANCE_CM) {
     // Too close to the left wall: nudge away from it.
-    turnLeft(TURN_PULSE_MS / 2);
+    turnByAngle((float)NUDGE_ANGLE_DEG);
     driveForward(FORWARD_PULSE_MS);
 #if DEBUG_WF
     emitWfDecide(front, left, leftRawValid, "nudge_off_wall");
@@ -418,6 +566,7 @@ void handleButton() {
 
 void setup() {
   Monitor.begin(9600);
+  Bridge.begin();
 
   pinMode(PWMA, OUTPUT);
   pinMode(PWMB, OUTPUT);
@@ -427,18 +576,28 @@ void setup() {
   digitalWrite(STBY, HIGH);
 
   pinMode(BUTTON_PIN, INPUT);
-  pinMode(TRIG, OUTPUT);
-  pinMode(ECHO, INPUT);
-  digitalWrite(TRIG, LOW);
 
   scanServo.attach(SERVO_PIN);
   scanServo.write(SERVO_CENTER);
+
+  // Modulino Distance is on the Qwiic connector, which is a separate I2C bus
+  // (Wire1) from the A4/A5 pins (Wire) used by the MPU6050. Use the library
+  // default bus for Qwiic.
+  Modulino.begin();
+  tofOk = tofSensor.begin();
+  emitTofStatus();
+
+  imuOk = mpuInit();
+  calibrateGyroBias();
 
   stopMotors();
   emitState("ready");
 }
 
 void loop() {
+  if (imuOk) {
+    updateYaw();
+  }
   handleButton();
 
   if (currentMode == "WALLFOLLOW") {
