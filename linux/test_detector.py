@@ -33,6 +33,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from detector import Detector, CATEGORY_OF, display_label  # noqa: E402
 
+_LINUX_DIR = os.path.dirname(os.path.abspath(__file__))
+_REPO_ROOT  = os.path.dirname(_LINUX_DIR)
+_DEFAULT_FRAME_PATH = os.path.join(_REPO_ROOT, "data", "logs", "camera_frame.jpg")
+
 
 def _print_categories() -> None:
     print("[test] mission classes -> categories:")
@@ -48,8 +52,13 @@ def run(args: argparse.Namespace) -> int:
     print(f"[test] opening camera {args.camera} with model {args.model} "
           f"(conf>={args.conf}) ...")
 
+    frame_path = None if args.no_save_frames else _DEFAULT_FRAME_PATH
+    if frame_path:
+        os.makedirs(os.path.dirname(frame_path), exist_ok=True)
+        print(f"[test] saving frames -> {frame_path}  (use --no-save-frames to disable)")
+
     det = Detector(camera_index=args.camera, model_path=args.model,
-                   conf=args.conf)
+                   conf=args.conf, frame_save_path=frame_path)
 
     if not det.available:
         print(f"[test] detector UNAVAILABLE: {det.error}")
@@ -117,6 +126,9 @@ def main(argv=None) -> int:
                    help="show annotated preview window (needs display)")
     p.add_argument("--once", action="store_true",
                    help="run a single frame then exit")
+    p.add_argument("--no-save-frames", action="store_true",
+                   help="disable saving annotated frames for the dashboard "
+                        f"(default saves to data/logs/camera_frame.jpg)")
     return run(p.parse_args(argv))
 
 

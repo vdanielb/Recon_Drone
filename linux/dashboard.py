@@ -19,6 +19,7 @@ import os
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LOG_DIR = os.path.join(REPO_ROOT, "data", "logs")
 STATUS_JSON = os.path.join(LOG_DIR, "status.json")
+CAMERA_FRAME = os.path.join(LOG_DIR, "camera_frame.jpg")
 
 
 def _read_status() -> dict:
@@ -260,6 +261,27 @@ PAGE = r"""<!doctype html>
     .det-note { color: var(--amber); font-size: 10px; }
     .no-det { color: var(--muted); font-size: 12px; padding: 6px 0; }
 
+    /* ── CAMERA FEED ─────────────────────────────────────────── */
+    .cam-wrap {
+      position: relative; width: 100%;
+      border-radius: 10px; overflow: hidden;
+      background: #060d16;
+      aspect-ratio: 4/3;
+      display: flex; align-items: center; justify-content: center;
+    }
+    #camImg {
+      width: 100%; height: 100%;
+      object-fit: contain; display: none;
+    }
+    .cam-placeholder {
+      color: var(--muted); font-size: 12px;
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center;
+      gap: 8px; width: 100%; height: 100%;
+      position: absolute; inset: 0;
+    }
+    .cam-placeholder svg { opacity: .3; }
+
     /* ── RIGHT COLUMN ────────────────────────────────────────── */
     .right-col { display: flex; flex-direction: column; gap: 14px; }
 
@@ -352,6 +374,23 @@ PAGE = r"""<!doctype html>
         </div>
         <div class="radar-wrap">
           <canvas id="radarCanvas"></canvas>
+        </div>
+      </div>
+
+      <!-- Camera feed -->
+      <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Camera feed</span>
+          <span class="panel-sub" id="camStatus">--</span>
+        </div>
+        <div class="cam-wrap">
+          <img id="camImg" alt="camera feed"/>
+          <div class="cam-placeholder" id="camPlaceholder">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+              <path d="M23 7l-7 5 7 5V7z"/><rect x="1" y="5" width="15" height="14" rx="2" ry="2"/>
+            </svg>
+            No camera frame
+          </div>
         </div>
       </div>
 
@@ -828,6 +867,35 @@ function updateUI(data) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Camera feed — always polls /api/camera/frame every 500 ms.
+// Works whether the camera runs via main.py or test_detector.py.
+// ─────────────────────────────────────────────────────────────────────────────
+function _showCamFrame(src) {
+  const img = document.getElementById("camImg");
+  const ph  = document.getElementById("camPlaceholder");
+  img.onload  = () => { img.style.display = "block"; ph.style.display = "none"; };
+  img.onerror = () => { img.style.display = "none";  ph.style.display = "flex"; };
+  img.src = src;
+}
+
+async function pollCamera() {
+  const stEl = document.getElementById("camStatus");
+  try {
+    const r = await fetch("/api/camera/frame?t=" + Date.now());
+    if (r.ok && r.status !== 204) {
+      stEl.textContent = "live";
+      _showCamFrame("/api/camera/frame?t=" + Date.now());
+    } else {
+      stEl.textContent = "waiting…";
+      document.getElementById("camImg").style.display = "none";
+      document.getElementById("camPlaceholder").style.display = "flex";
+    }
+  } catch (_) {
+    stEl.textContent = "err";
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Polling
 // ─────────────────────────────────────────────────────────────────────────────
 async function poll() {
@@ -844,7 +912,9 @@ window.updateUI = d => { _lastData = d; _origUpdateUI(d); };
 window.addEventListener("resize", () => { if (_lastData) _origUpdateUI(_lastData); });
 
 poll();
+pollCamera();
 setInterval(poll, 500);
+setInterval(pollCamera, 500);
 </script>
 </body>
 </html>"""
@@ -867,6 +937,18 @@ def create_app():
     @app.route("/api/status")
     def api_status():
         return jsonify(_read_status())
+
+    @app.route("/api/camera/frame")
+    def api_camera_frame():
+        if not os.path.exists(CAMERA_FRAME):
+            return Response("", status=204)
+        try:
+            with open(CAMERA_FRAME, "rb") as fh:
+                data = fh.read()
+            return Response(data, mimetype="image/jpeg",
+                            headers={"Cache-Control": "no-store, no-cache"})
+        except OSError:
+            return Response("", status=204)
 
     return app
 

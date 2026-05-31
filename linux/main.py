@@ -99,7 +99,8 @@ def run(args: argparse.Namespace) -> int:
     detector = None
     if not args.no_detect and Detector is not None:
         detector = Detector(camera_index=args.camera, model_path=args.model,
-                            conf=args.detect_conf)
+                            conf=args.detect_conf,
+                            frame_save_path=os.path.join(log_dir, "camera_frame.jpg"))
         if detector.available:
             detector.start()
             print(f"[detect] camera {args.camera} + {args.model} active")

@@ -74,6 +74,15 @@ def display_label(coco_name: str) -> str:
     return DISPLAY_LABEL.get(coco_name, coco_name)
 
 
+# Category -> BGR color for cv2 annotation (mirrors CATEGORY_COLORS in dashboard.py).
+_CATEGORY_BGR: Dict[str, tuple] = {
+    "human":       (112,  84, 255),   # #ff5470 -> BGR
+    "bag":         ( 35, 166, 245),   # #f5a623
+    "electronics": (255, 168,  78),   # #4ea8ff
+    "environment": (160, 211,  34),   # #22d3a0
+}
+
+
 class Detector:
     """Background-thread YOLO detector with graceful degradation.
 
@@ -90,12 +99,14 @@ class Detector:
 
     def __init__(self, camera_index: int = 0, model_path: str = "yolov8n.pt",
                  conf: float = 0.45, hfov_deg: float = 60.0,
-                 imgsz: int = 416) -> None:
+                 imgsz: int = 416,
+                 frame_save_path: Optional[str] = None) -> None:
         self.camera_index = camera_index
         self.model_path = model_path
         self.conf = conf
         self.hfov_deg = hfov_deg
         self.imgsz = imgsz
+        self.frame_save_path = frame_save_path
 
         self.available = False
         self.error: Optional[str] = None
@@ -263,6 +274,9 @@ class Detector:
             with self._lock:
                 self._latest = detections
 
+            if self.frame_save_path is not None:
+                self._save_frame(frame, detections)
+
             self._frames += 1
             now = time.time()
             dt = now - last_t
@@ -270,6 +284,37 @@ class Detector:
                 # Exponential moving average for a stable FPS readout.
                 self._fps = 0.8 * self._fps + 0.2 * (1.0 / dt) if self._fps else 1.0 / dt
             last_t = now
+
+    def _save_frame(self, frame, detections: List[dict]) -> None:
+        """Write an annotated JPEG of the latest frame atomically.
+
+        Uses a .tmp file + os.replace so the dashboard never reads a partial
+        write.  Silently swallows all errors so it never disrupts inference.
+        """
+        cv2 = self._cv2
+        try:
+            vis = frame.copy()
+            for d in detections:
+                bbox = d.get("bbox_xyxy")
+                if bbox is None:
+                    continue
+                x1, y1, x2, y2 = (int(v) for v in bbox)
+                col = _CATEGORY_BGR.get(d.get("category", ""), (192, 192, 192))
+                cv2.rectangle(vis, (x1, y1), (x2, y2), col, 2)
+                txt = f"{d['label']} {d['confidence']:.0%}"
+                (tw, th), _ = cv2.getTextSize(txt, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(vis, (x1, y1 - th - 6), (x1 + tw + 4, y1), col, -1)
+                cv2.putText(vis, txt, (x1 + 2, y1 - 4),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1,
+                            cv2.LINE_AA)
+            ok, buf = cv2.imencode(".jpg", vis, [cv2.IMWRITE_JPEG_QUALITY, 75])
+            if ok:
+                tmp = self.frame_save_path + ".tmp"
+                with open(tmp, "wb") as fh:
+                    fh.write(buf.tobytes())
+                os.replace(tmp, self.frame_save_path)
+        except Exception:
+            pass
 
     def _infer(self, frame) -> List[dict]:
         """Dispatch to the active backend."""
@@ -306,9 +351,11 @@ class Detector:
                 if coco_name not in MISSION_CLASSES:
                     continue
                 cx_frac = 0.5
+                bbox_xyxy = None
                 try:
-                    x1, _, x2, _ = (float(v) for v in box.xyxy[0])
+                    x1, y1, x2, y2 = (float(v) for v in box.xyxy[0])
                     cx_frac = min(1.0, max(0.0, ((x1 + x2) / 2.0) / width))
+                    bbox_xyxy = [round(x1), round(y1), round(x2), round(y2)]
                 except Exception:
                     pass
                 out.append({
@@ -317,6 +364,7 @@ class Detector:
                     "category": CATEGORY_OF[coco_name],
                     "confidence": round(conf, 3),
                     "bbox_cx_frac": round(cx_frac, 3),
+                    "bbox_xyxy": bbox_xyxy,
                 })
         return out
 
@@ -391,13 +439,17 @@ class Detector:
                 continue
             conf_val = float(max_scores[idx])
             x1 = x1s[idx]
-            cx_frac = min(1.0, max(0.0, (x1 + bws[idx] / 2) / orig_w))
+            y1 = y1s[idx]
+            bw_ = bws[idx]
+            bh_ = bhs[idx]
+            cx_frac = min(1.0, max(0.0, (x1 + bw_ / 2) / orig_w))
             out.append({
                 "label": display_label(coco_name),
                 "coco": coco_name,
                 "category": CATEGORY_OF[coco_name],
                 "confidence": round(conf_val, 3),
                 "bbox_cx_frac": round(cx_frac, 3),
+                "bbox_xyxy": [int(x1), int(y1), int(x1 + bw_), int(y1 + bh_)],
             })
         return out
 
