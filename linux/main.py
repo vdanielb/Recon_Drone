@@ -112,7 +112,7 @@ def run(args: argparse.Namespace) -> int:
 
     recent_detections: List[dict] = []   # last N for status.json
     detection_counts: dict = {}
-    cat_last_seen: dict = {}             # category -> monotonic time (cooldown)
+    det_was_present: dict = {}           # category -> bool (rising-edge tracking)
     MAX_RECENT_DET = 12
 
     det_fh = open(detections_csv, "w", newline="", encoding="utf-8")
@@ -191,51 +191,63 @@ def run(args: argparse.Namespace) -> int:
     def poll_detections() -> bool:
         """Pull the latest camera detections and tag them on the map.
 
-        A per-category cooldown prevents the same object from spamming the
-        map every frame. Placement uses the latest front ultrasonic distance;
-        if none is available the tag is marked distance_unknown. Returns True
-        if any new tag was added.
+        Uses rising-edge detection: a category is only counted and tagged when
+        it transitions from absent → present. While it stays in frame it is
+        not re-counted. Resets when it leaves frame. Returns True if any new
+        tag was added.
         """
         if detector is None:
             return False
         added = False
         front = _front_distance()
-        now = time.monotonic()
+
+        # Build current-frame presence map (highest-conf per category)
+        now_present: dict = {}
         for d in detector.get_latest():
             cat = d["category"]
-            if now - cat_last_seen.get(cat, -1e9) < args.detect_cooldown:
-                continue
-            cat_last_seen[cat] = now
+            if cat not in now_present or d["confidence"] > now_present[cat]["confidence"]:
+                now_present[cat] = d
 
-            bearing = detector.bearing_deg(d.get("bbox_cx_frac", 0.5))
-            tag = mapper.add_detection_tag(cat, d["label"], d["confidence"],
-                                           front, bearing_deg=bearing)
-            detection_counts[cat] = detection_counts.get(cat, 0) + 1
+        # Rising-edge: only act when a category appears fresh (was absent)
+        for cat, d in now_present.items():
+            if not det_was_present.get(cat, False):
+                bearing = detector.bearing_deg(d.get("bbox_cx_frac", 0.5))
+                tag = mapper.add_detection_tag(cat, d["label"], d["confidence"],
+                                               front, bearing_deg=bearing)
+                detection_counts[cat] = detection_counts.get(cat, 0) + 1
 
-            rec = {
-                "ts": datetime.now().strftime("%H:%M:%S"),
-                "category": cat,
-                "label": d["label"],
-                "conf": d["confidence"],
-                "distance_cm": front,
-                "x": tag["x"],
-                "y": tag["y"],
-                "note": tag.get("note", ""),
-            }
-            recent_detections.insert(0, rec)
-            del recent_detections[MAX_RECENT_DET:]
+                rec = {
+                    "ts": datetime.now().strftime("%H:%M:%S"),
+                    "category": cat,
+                    "label": d["label"],
+                    "conf": d["confidence"],
+                    "distance_cm": front,
+                    "x": tag["x"],
+                    "y": tag["y"],
+                    "note": tag.get("note", ""),
+                }
+                recent_detections.insert(0, rec)
+                del recent_detections[MAX_RECENT_DET:]
 
-            dist_str = f"{front:.0f}cm" if front is not None else "dist?"
-            append_event(f"DET {cat}:{d['label']} {d['confidence']:.0%} @ {dist_str}")
-            det_writer.writerow([
-                datetime.now().isoformat(timespec="seconds"), cat, d["label"],
-                f"{d['confidence']:.3f}",
-                "" if front is None else f"{front:.1f}",
-                f"{tag['x']:.1f}", f"{tag['y']:.1f}", tag.get("note", ""),
-            ])
-            det_fh.flush()
-            print(f"[detect] {cat}:{d['label']} {d['confidence']:.0%} @ {dist_str}")
-            added = True
+                dist_str = f"{front:.0f}cm" if front is not None else "dist?"
+                append_event(f"DET {cat}:{d['label']} {d['confidence']:.0%} @ {dist_str}")
+                det_writer.writerow([
+                    datetime.now().isoformat(timespec="seconds"), cat, d["label"],
+                    f"{d['confidence']:.3f}",
+                    "" if front is None else f"{front:.1f}",
+                    f"{tag['x']:.1f}", f"{tag['y']:.1f}", tag.get("note", ""),
+                ])
+                det_fh.flush()
+                print(f"[detect] {cat}:{d['label']} {d['confidence']:.0%} @ {dist_str}")
+                added = True
+
+        # Update presence state for next poll
+        for cat in list(det_was_present.keys()):
+            if cat not in now_present:
+                det_was_present[cat] = False
+        for cat in now_present:
+            det_was_present[cat] = True
+
         return added
 
     print(f"[main] DARKMAP-Q offline mapper - source={args.source}"

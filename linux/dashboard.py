@@ -116,13 +116,20 @@ PAGE = r"""<!doctype html>
     }
 
     /* ── PAGE BODY ───────────────────────────────────────────── */
-    .page { padding: 20px 24px 32px; }
+    .page {
+      padding: 12px 24px 12px;
+      height: calc(100vh - 52px);   /* fill below the nav bar */
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
 
     /* ── RISK BANNER ─────────────────────────────────────────── */
     .risk-banner {
-      display: flex; align-items: center; gap: 12px;
-      padding: 11px 18px; border-radius: 10px; margin-bottom: 20px;
+      display: inline-flex; align-items: center; gap: 12px;
+      padding: 8px 14px; border-radius: 10px; margin-bottom: 10px;
       font-size: 13px; font-weight: 600; border: 1px solid;
+      align-self: flex-start;
       transition: background .3s, border-color .3s, color .3s;
     }
     .risk-icon { font-size: 16px; }
@@ -132,15 +139,35 @@ PAGE = r"""<!doctype html>
                    animation: flash .8s step-end infinite; }
     @keyframes flash { 0%,100%{opacity:1} 50%{opacity:.6} }
 
-    /* ── STAT CARDS ──────────────────────────────────────────── */
+    /* ── TOP BAR (stat cards + recon detections) ─────────────── */
+    .topbar {
+      display: flex; align-items: stretch; gap: 10px;
+      margin-bottom: 10px; flex-shrink: 0;
+    }
     .cards {
       display: grid;
-      grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-      gap: 10px; margin-bottom: 20px;
+      grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+      gap: 10px; flex: 1;
     }
+    /* detections panel sits flush to the right inside the topbar */
+    .det-panel {
+      flex-shrink: 0; width: 400px;
+      padding: 8px 14px;
+      display: flex; align-items: center;
+    }
+    .det-strip-inner {
+      display: flex; align-items: center; gap: 12px; width: 100%;
+    }
+    .det-strip-title { min-width: 80px; }
+    .det-panel .people-counter {
+      margin-bottom: 0; padding: 4px 10px; flex-shrink: 0;
+    }
+    .det-panel .people-num { font-size: 22px; }
+    .det-panel .people-label { font-size: 10px; }
+    .det-panel .det-counts { display: none; }
     .card {
       background: var(--surface); border: 1px solid var(--border);
-      border-radius: 12px; padding: 13px 15px;
+      border-radius: 12px; padding: 9px 13px;
       transition: border-color .2s;
     }
     .card:hover { border-color: var(--border2); }
@@ -151,6 +178,7 @@ PAGE = r"""<!doctype html>
     .card-val {
       font-size: 20px; font-weight: 700; margin-top: 5px;
       line-height: 1.2; color: var(--text);
+      word-break: break-all; overflow-wrap: anywhere;
     }
     .card-val.sm { font-size: 14px; font-weight: 600; }
     .card-val.mono {
@@ -166,9 +194,13 @@ PAGE = r"""<!doctype html>
     /* ── MAIN LAYOUT ─────────────────────────────────────────── */
     .layout {
       display: grid;
-      grid-template-columns: 1fr 270px;
-      gap: 16px;
+      grid-template-columns: 1fr 400px;
+      gap: 10px;
+      flex: 1;
+      min-height: 0;
+      overflow: hidden;
     }
+    .layout > .panel { overflow: hidden; }
     @media (max-width: 840px) { .layout { grid-template-columns: 1fr; } }
 
     /* ── PANELS ──────────────────────────────────────────────── */
@@ -190,12 +222,17 @@ PAGE = r"""<!doctype html>
     }
 
     /* ── MAP CANVAS ──────────────────────────────────────────── */
+    .layout > .panel {
+      display: flex; flex-direction: column;
+      height: 100%;
+    }
     .map-wrap {
       position: relative; width: 100%;
       border-radius: 10px; overflow: hidden;
       background: #060d16;
-      /* maintain 4:3 but allow taller on small screens */
-      aspect-ratio: 4/3;
+      flex: 1;
+      min-height: 0;
+      min-height: 200px;  /* fallback so it's never invisible */
     }
     #mapCanvas {
       position: absolute; inset: 0;
@@ -213,6 +250,7 @@ PAGE = r"""<!doctype html>
     /* ── RADAR CANVAS ────────────────────────────────────────── */
     .radar-wrap {
       width: 100%; aspect-ratio: 1;
+      max-height: 200px;
       border-radius: 10px; overflow: hidden;
       background: #060d16;
     }
@@ -220,7 +258,7 @@ PAGE = r"""<!doctype html>
 
     /* ── EVENT LOG ───────────────────────────────────────────── */
     .events {
-      max-height: 420px; overflow-y: auto;
+      max-height: 120px; overflow-y: auto;
       scrollbar-width: thin;
       scrollbar-color: var(--border2) transparent;
     }
@@ -248,7 +286,7 @@ PAGE = r"""<!doctype html>
       border: 1px solid var(--border2); background: var(--surface2);
     }
     .det-swatch { width: 8px; height: 8px; border-radius: 2px; transform: rotate(45deg); }
-    .det-list { max-height: 220px; overflow-y: auto; scrollbar-width: thin; }
+    .det-list { display: none; }  /* moved out of topbar; hidden */
     .det-row {
       display: flex; gap: 8px; align-items: baseline;
       padding: 5px 0; border-bottom: 1px solid #0d1824;
@@ -261,17 +299,57 @@ PAGE = r"""<!doctype html>
     .det-note { color: var(--amber); font-size: 10px; }
     .no-det { color: var(--muted); font-size: 12px; padding: 6px 0; }
 
+    /* ── PEOPLE COUNTER ──────────────────────────────────────── */
+    .people-counter {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 12px; margin-bottom: 8px;
+      background: var(--surface2); border-radius: 10px;
+      border: 1px solid var(--border2);
+    }
+    .people-icon { color: #ff5470; flex-shrink: 0; }
+    .people-num {
+      font-size: 28px; font-weight: 700; line-height: 1;
+      color: #ff5470; font-family: 'JetBrains Mono', monospace;
+      min-width: 2ch; text-align: center;
+    }
+    .people-label { font-size: 11px; color: var(--muted); line-height: 1.4; }
+    /* compact detections panel — shrinks to fit content */
+    .det-panel { flex-shrink: 0; }
+
+    /* ── RECON DETECTIONS STRIP ──────────────────────────────── */
+    .det-panel {
+      flex-shrink: 0;
+      padding: 10px 14px;
+    }
+    .det-strip-inner {
+      display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+    }
+    .det-strip-title {
+      display: flex; flex-direction: column; gap: 2px; min-width: 100px;
+    }
+    .det-strip .people-counter {
+      margin-bottom: 0; padding: 6px 12px; flex-shrink: 0;
+    }
+    .det-strip .people-num { font-size: 24px; }
+    .det-strip .det-counts { margin-bottom: 0; display: flex; gap: 6px; flex-wrap: wrap; }
+    .det-list-inline {
+      display: flex; flex-wrap: wrap; gap: 6px;
+      max-height: none; overflow: visible;
+    }
+    .det-list-inline .no-det { font-size: 11px; color: var(--muted); }
+
     /* ── CAMERA FEED ─────────────────────────────────────────── */
+    .cam-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
     .cam-wrap {
       position: relative; width: 100%;
       border-radius: 10px; overflow: hidden;
       background: #060d16;
-      aspect-ratio: 4/3;
-      display: flex; align-items: center; justify-content: center;
+      aspect-ratio: 16/9;   /* matches webcam native — no cropping, no bars */
+      flex-shrink: 0;
     }
     #camImg {
       width: 100%; height: 100%;
-      object-fit: contain; display: none;
+      object-fit: contain; display: none; width: 100%; height: 100%;
     }
     .cam-placeholder {
       color: var(--muted); font-size: 12px;
@@ -283,7 +361,13 @@ PAGE = r"""<!doctype html>
     .cam-placeholder svg { opacity: .3; }
 
     /* ── RIGHT COLUMN ────────────────────────────────────────── */
-    .right-col { display: flex; flex-direction: column; gap: 14px; }
+    .right-col {
+      display: flex; flex-direction: column; gap: 10px;
+      height: 100%; overflow-y: auto;
+      scrollbar-width: none;
+    }
+    .right-col::-webkit-scrollbar { display: none; }
+    .right-col .panel { flex-shrink: 0; }
 
     /* ── FOOTER ──────────────────────────────────────────────── */
     footer {
@@ -314,36 +398,55 @@ PAGE = r"""<!doctype html>
     <span id="riskText">CLEAR &nbsp;·&nbsp; Front: --</span>
   </div>
 
-  <div class="cards">
-    <div class="card">
-      <div class="card-label">Scene</div>
-      <div class="card-val sm c-green" id="cScene">--</div>
+  <div class="topbar">
+    <div class="cards">
+      <div class="card">
+        <div class="card-label">Scene</div>
+        <div class="card-val sm c-green" id="cScene">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Obstacles</div>
+        <div class="card-val" id="cObstacles">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Path pts</div>
+        <div class="card-val" id="cPath">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Pose (cm)</div>
+        <div class="card-val mono sm" id="cPose">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Heading</div>
+        <div class="card-val sm" id="cTheta">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Last scan</div>
+        <div class="card-val sm mono" id="cDist">--</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Last move</div>
+        <div class="card-val sm mono" id="cAction">--</div>
+      </div>
     </div>
-    <div class="card">
-      <div class="card-label">Obstacles</div>
-      <div class="card-val" id="cObstacles">--</div>
+
+    <!-- Recon detections — compact counter, right side of topbar -->
+    <div class="panel det-panel">
+      <div class="det-strip-inner">
+        <div class="det-strip-title">
+          <span class="panel-title">Recon detections</span>
+          <span class="panel-sub" id="detFps">--</span>
+        </div>
+        <div class="people-counter" id="peopleCounter">
+          <div class="people-num" id="peopleCount">0</div>
+          <div class="people-label">people detected</div>
+        </div>
+        <div class="det-counts" id="detCounts"></div>
+      </div>
     </div>
-    <div class="card">
-      <div class="card-label">Path pts</div>
-      <div class="card-val" id="cPath">--</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Pose (cm)</div>
-      <div class="card-val mono sm" id="cPose">--</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Heading</div>
-      <div class="card-val sm" id="cTheta">--</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Last scan</div>
-      <div class="card-val sm mono" id="cDist">--</div>
-    </div>
-    <div class="card">
-      <div class="card-label">Last move</div>
-      <div class="card-val sm mono" id="cAction">--</div>
-    </div>
-  </div>
+  </div><!-- /.topbar -->
+  <!-- hidden det-list kept for JS compatibility -->
+  <div id="detList" style="display:none"></div>
 
   <div class="layout">
 
@@ -377,8 +480,18 @@ PAGE = r"""<!doctype html>
         </div>
       </div>
 
-      <!-- Camera feed -->
+      <!-- Event log -->
       <div class="panel">
+        <div class="panel-header">
+          <span class="panel-title">Event log</span>
+        </div>
+        <div class="events" id="eventLog">
+          <div class="no-events">Waiting for events…</div>
+        </div>
+      </div>
+
+      <!-- Camera feed -->
+      <div class="panel cam-panel">
         <div class="panel-header">
           <span class="panel-title">Camera feed</span>
           <span class="panel-sub" id="camStatus">--</span>
@@ -391,28 +504,6 @@ PAGE = r"""<!doctype html>
             </svg>
             No camera frame
           </div>
-        </div>
-      </div>
-
-      <!-- Detections -->
-      <div class="panel">
-        <div class="panel-header">
-          <span class="panel-title">Recon detections</span>
-          <span class="panel-sub" id="detFps">--</span>
-        </div>
-        <div class="det-counts" id="detCounts"></div>
-        <div class="det-list" id="detList">
-          <div class="no-det">No detections yet…</div>
-        </div>
-      </div>
-
-      <!-- Event log -->
-      <div class="panel" style="flex:1">
-        <div class="panel-header">
-          <span class="panel-title">Event log</span>
-        </div>
-        <div class="events" id="eventLog">
-          <div class="no-events">Waiting for events…</div>
         </div>
       </div>
 
@@ -798,6 +889,10 @@ function renderDetector(data) {
 function renderDetections(data) {
   const counts = data.detection_counts || {};
   const recent = data.detections || [];
+
+  // Big people counter
+  const peopleEl = document.getElementById("peopleCount");
+  if (peopleEl) peopleEl.textContent = counts["human"] || 0;
 
   const countsEl = document.getElementById("detCounts");
   const cats = Object.keys(counts);
