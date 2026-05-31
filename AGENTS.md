@@ -65,7 +65,7 @@ Valid `mode` values: `AUTO`, `MANUAL`, `SCAN_ONLY`, `WALLFOLLOW`, `STOP`.
 | `a` | `AUTO` | Reactive obstacle avoidance — moves forward, dodges walls |
 | `m` | `MANUAL` | Human-driven via `i/k/j/l` keys; scanning continues |
 | `o` | `SCAN_ONLY` | Stationary; full servo sweep every 150 ms |
-| `w` | `WALLFOLLOW` | Autonomous perimeter scan (right-hand rule, Roomba-style) |
+| `w` | `WALLFOLLOW` | Autonomous perimeter scan (left-hand rule, Roomba-style) |
 | `x` | `STOP` | Motors off |
 
 ---
@@ -75,37 +75,44 @@ Valid `mode` values: `AUTO`, `MANUAL`, `SCAN_ONLY`, `WALLFOLLOW`, `STOP`.
 The primary room-mapping mode. The rover:
 
 1. **Acquisition phase** — drives straight forward until a wall is within
-   `WF_CORNER_THRESHOLD_CM`, then turns left 90° so the wall becomes the
-   right-side reference. Emits `STATE,...,WALLFOLLOW,wf_acquired` on transition.
-2. **Following phase** — keeps the right wall at `TARGET_WALL_CM` using a
-   five-case decision loop every step:
-   - Front blocked → turn left 90° (inner corner)
-   - Right wall lost → overshoot + turn right 90° (outer corner)
-   - Drifting away from wall → nudge right + forward
-   - Too close to wall → nudge left + forward
+   `WF_CORNER_THRESHOLD_CM`, then turns 90° (`turnLeft()` call) to reorient so
+   the wall becomes the **left-side** reference, then nudges forward to clear
+   the corner. Emits `STATE,...,WALLFOLLOW,wf_acquired` on transition.
+2. **Following phase** — keeps the left wall at `TARGET_WALL_CM` using a
+   five-case decision loop every step. The wall is sensed entirely from the
+   sweep, so no scanning turns are needed:
+   - Front blocked → turn away from wall (inner corner)
+   - Left wall lost → overshoot + turn toward wall (outer corner)
+   - Drifting away from wall → nudge toward wall + forward
+   - Too close to wall → nudge away from wall + forward
    - On track → drive straight
 
-Right-wall distance uses `scanRightWall()` which takes the **minimum of the
-45° and 75° right-side readings**. This prevents false "wall lost" triggers
-at wall segment ends where the outer beam sees past the edge.
+Left-wall distance uses `leftWallFromSweep()` which takes the **minimum of the
+-45° and -75° left-side readings** from the cached sweep. This prevents false
+"wall lost" triggers at wall segment ends where the outer beam sees past the
+edge.
 
 `wf_acquired` is a global `bool` in the sketch, reset to `false` every time
 `WALLFOLLOW` mode is entered. It separates Phase 1 (acquisition) from Phase 2
 (following). The Python simulator mirrors this with an internal `_acquired` flag
 in `WallFollowSimSource`.
 
-### Wall-following constants (all in `darkmap_rover.ino`)
+### Wall-following constants (all in `sketch.ino`)
 
 | Constant | Default | Notes |
 |---|---|---|
-| `WF_TURN90_MS` | 700 ms | Duration of a ~90° in-place turn. **Calibrate on real hardware.** |
-| `TURN_PULSE_MS` | 250 ms | Half used for nudge corrections; ~`WF_TURN90_MS / 4` |
+| `WF_TURN90_MS` | 600 ms | Duration of a ~90° in-place turn. **Calibrate on real hardware.** |
+| `TURN_PULSE_MS` | 100 ms | Half used for nudge corrections (`TURN_PULSE_MS / 2`) |
 | `FORWARD_PULSE_MS` | 300 ms | Step distance per action |
-| `TARGET_WALL_CM` | 20 cm | Desired gap to the right wall |
-| `WALL_TOLERANCE_CM` | 5 cm | Dead band; widen to reduce oscillation |
+| `TARGET_WALL_CM` | 45 cm | Desired gap to the left wall |
+| `WALL_TOLERANCE_CM` | 15 cm | Dead band; widen to reduce oscillation |
 | `WF_CORNER_THRESHOLD_CM` | 25 cm | Front distance that triggers a corner turn |
-| `WF_OPEN_THRESHOLD_CM` | 50 cm | Right-side distance that counts as "wall lost" |
+| `WF_OPEN_THRESHOLD_CM` | 50 cm | Left-side distance that counts as "wall lost" |
 | `BASE_SPEED` / `TURN_SPEED` | 120 PWM | Motor power 0–255; start low |
+
+Keep `WF_OPEN_THRESHOLD_CM` above `TARGET_WALL_CM + WALL_TOLERANCE_CM`, otherwise
+the steady-state hug distance can be misread as "wall lost" and trigger spurious
+outer-corner turns.
 
 ---
 
@@ -364,9 +371,9 @@ look rotated or sheared even when navigation is correct.
 - **`status.json` field names** — the dashboard JavaScript reads these directly.
 - **`SPEED_CM_PER_SEC` / `TURN_DEG_PER_SEC`** without a calibration note.
 - **Motor driver pins D5/D6/D9/D10** without checking the physical wiring first.
-- **`scanRightWall()`** logic — it uses min(45°, 75°) specifically to prevent
-  false open-corner reads at wall segment ends. Do not reduce this to a single
-  angle.
+- **`leftWallFromSweep()`** logic — it uses min(-45°, -75°) specifically to
+  prevent false open-corner reads at wall segment ends. Do not reduce this to a
+  single angle.
 - **`ensureCanvasSize()`** in `dashboard.py` — it intentionally avoids resetting
   `canvas.width` on every poll to prevent the blank-canvas bug. Do not replace
   it with a naive resize call.

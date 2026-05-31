@@ -1,3 +1,20 @@
+/*
+ * DARKMAP-Q — creep-mode wall follower (UNO Q MCU)
+ *
+ * Continuous slow creep instead of pulse-stop-scan-pulse:
+ *   - Motors stay on during fullSweepMoving()
+ *   - Straight / nudge branches use differential PWM arcs
+ *   - Inner / outer corners use blocking in-place pivots
+ *   - Periodic MOVE packets preserve mapper.py dead-reckoning
+ *
+ * Limitations:
+ *   - Ultrasonic readings are noisier while moving (vibration + sweep smear)
+ *   - Arc steering is reported as FORWARD; map heading may drift slightly
+ *   - Corner pivots briefly interrupt forward creep
+ *
+ * Upload this folder as its own sketch (do not merge with arduino/sketch.ino).
+ */
+
 #include <Servo.h>
 
 // Elegoo V4 motor pins (TB6612 shield)
@@ -17,17 +34,22 @@
 // Wall-following tuning — calibrate on real hardware
 const int WF_TURN90_MS           = 500;
 const int TURN_PULSE_MS          = 100;
-const int FORWARD_PULSE_MS       = 500;
-const int TARGET_WALL_CM         = 50; // Desired gap to the left wall +- WALL_TOLERANCE_CM
-const int WALL_TOLERANCE_CM      = 25;
-const int WF_CORNER_THRESHOLD_CM = 50; // How close something in front can get before a left pivot (inner corner / acquisition)
-const int WF_OPEN_THRESHOLD_CM   = 75; // left distance that counts as "wall lost" → triggers an outer-corner turn right.
+const int FORWARD_PULSE_MS       = 300;
+const int TARGET_WALL_CM         = 100;
+const int WALL_TOLERANCE_CM      = 20;
+const int WF_CORNER_THRESHOLD_CM = 25;
+const int WF_OPEN_THRESHOLD_CM   = 150;
 // WF_OPEN_THRESHOLD_CM must stay above TARGET_WALL_CM + WALL_TOLERANCE_CM.
 const int BASE_SPEED             = 120;
 const int TURN_SPEED             = 120;
 
+// Creep motion (continuous forward / arc; corners still use TURN_SPEED pivots)
+const int CREEP_SPEED            = 80;
+const int CREEP_ARC_DELTA        = 35;
+const int OUTER_OVERSHOOT_MS     = 400;
+
 // Ultrasonic limits
-const unsigned long ECHO_TIMEOUT_US = 25000UL;  // ~4.3 m round-trip cap
+const unsigned long ECHO_TIMEOUT_US = 25000UL;
 const long DIST_MIN_CM = 3;
 const long DIST_MAX_CM = 250;
 const int SERVO_SETTLE_MS = 80;
@@ -55,7 +77,7 @@ int lastReading = HIGH;
 int stableState = HIGH;
 unsigned long lastChange = 0;
 
-// Cached distances from the latest fullSweep (same index as SCAN_ANGLES)
+// Cached distances from the latest sweep (same index as SCAN_ANGLES)
 long lastSweepDistCm[SCAN_COUNT];
 
 // Last front distance from a full sweep (telemetry 0 deg)
@@ -64,6 +86,10 @@ long lastFrontDistCm = -1;
 // Last valid min(-45°, -75°) left-wall reading
 long lastValidLeftCm = -1;
 unsigned long lastValidLeftMs = 0;
+
+// MOVE segment tracking for mapper dead-reckoning
+String currentAction = "";
+unsigned long segmentStartMs = 0;
 
 // ---------------------------------------------------------------------------
 // Telemetry helpers
@@ -108,21 +134,28 @@ void emitState(const char *message) {
   Monitor.println(message);
 }
 
-void setMode(const String &mode) {
-  if (currentMode == mode) {
+// Emit elapsed time in currentAction, then reset segment timer.
+void emitSegmentMove() {
+  if (currentAction.length() == 0) {
+    segmentStartMs = millis();
     return;
   }
+  unsigned long elapsed = millis() - segmentStartMs;
+  if (elapsed > 0) {
+    int speed = CREEP_SPEED;
+    if (currentAction == "TURN_LEFT" || currentAction == "TURN_RIGHT") {
+      speed = TURN_SPEED;
+    }
+    emitMove(currentAction.c_str(), (int)elapsed, speed);
+  }
+  segmentStartMs = millis();
+}
 
-  currentMode = mode;
-  stopMotors();
-
-  if (currentMode == "WALLFOLLOW") {
-    wf_acquired = false;
-    lastValidLeftCm = -1;
-    lastValidLeftMs = 0;
-    emitState("wf_start");
-  } else if (currentMode == "STOP") {
-    emitState("stopped");
+void setCreepAction(const char *action) {
+  if (currentAction != action) {
+    emitSegmentMove();
+    currentAction = action;
+    segmentStartMs = millis();
   }
 }
 
@@ -135,17 +168,54 @@ void stopMotors() {
   analogWrite(PWMB, 0);
 }
 
-void driveForward(int durationMs) {
+void creepStraight() {
   digitalWrite(AIN1, HIGH);
   digitalWrite(BIN1, HIGH);
-  analogWrite(PWMA, BASE_SPEED);
-  analogWrite(PWMB, BASE_SPEED);
-  delay(durationMs);
-  stopMotors();
-  emitMove("FORWARD", durationMs, BASE_SPEED);
+  analogWrite(PWMA, CREEP_SPEED);
+  analogWrite(PWMB, CREEP_SPEED);
+  setCreepAction("FORWARD");
+}
+
+// Curve toward left wall (left wheel slower).
+void creepArcTowardWall() {
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(BIN1, HIGH);
+  int inner = CREEP_SPEED - CREEP_ARC_DELTA;
+  if (inner < 0) {
+    inner = 0;
+  }
+  analogWrite(PWMA, inner);
+  analogWrite(PWMB, CREEP_SPEED);
+  setCreepAction("FORWARD");
+}
+
+// Curve away from left wall (right wheel slower).
+void creepArcAwayFromWall() {
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(BIN1, HIGH);
+  int inner = CREEP_SPEED - CREEP_ARC_DELTA;
+  if (inner < 0) {
+    inner = 0;
+  }
+  analogWrite(PWMA, CREEP_SPEED);
+  analogWrite(PWMB, inner);
+  setCreepAction("FORWARD");
+}
+
+// Blocking forward creep for corner overshoot / acquisition nudge.
+void creepForwardTimed(int durationMs) {
+  creepStraight();
+  unsigned long t0 = millis();
+  while (millis() - t0 < (unsigned long)durationMs) {
+    delay(10);
+  }
+  emitSegmentMove();
 }
 
 void turnLeft(int durationMs) {
+  emitSegmentMove();
+  stopMotors();
+  currentAction = "";
   digitalWrite(AIN1, LOW);
   digitalWrite(BIN1, HIGH);
   analogWrite(PWMA, TURN_SPEED);
@@ -153,9 +223,13 @@ void turnLeft(int durationMs) {
   delay(durationMs);
   stopMotors();
   emitMove("TURN_LEFT", durationMs, TURN_SPEED);
+  segmentStartMs = millis();
 }
 
 void turnRight(int durationMs) {
+  emitSegmentMove();
+  stopMotors();
+  currentAction = "";
   digitalWrite(AIN1, HIGH);
   digitalWrite(BIN1, LOW);
   analogWrite(PWMA, TURN_SPEED);
@@ -163,6 +237,28 @@ void turnRight(int durationMs) {
   delay(durationMs);
   stopMotors();
   emitMove("TURN_RIGHT", durationMs, TURN_SPEED);
+  segmentStartMs = millis();
+}
+
+void setMode(const String &mode) {
+  if (currentMode == mode) {
+    return;
+  }
+
+  emitSegmentMove();
+  currentMode = mode;
+  stopMotors();
+  currentAction = "";
+
+  if (currentMode == "WALLFOLLOW") {
+    wf_acquired = false;
+    lastValidLeftCm = -1;
+    lastValidLeftMs = 0;
+    segmentStartMs = millis();
+    emitState("wf_start");
+  } else if (currentMode == "STOP") {
+    emitState("stopped");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -230,9 +326,8 @@ long scanAtAngle(int telemetryDeg) {
   return readDistanceCM();
 }
 
-void fullSweep() {
-  stopMotors();
-
+// Full sweep without stopping motors (creep continues during scan).
+void fullSweepMoving() {
   for (int i = 0; i < SCAN_COUNT; i++) {
     int angle = SCAN_ANGLES[i];
     long dist = scanAtAngle(angle);
@@ -246,9 +341,6 @@ void fullSweep() {
   scanServo.write(SERVO_CENTER);
 }
 
-// Combine the two left-side beams. Using min(-45°, -75°) prevents false
-// "wall lost" reads at wall segment ends where the outer beam sees past
-// the edge.
 long combineSideWall(long dInner, long dOuter) {
   if (dInner >= 0 && dOuter >= 0) {
     return min(dInner, dOuter);
@@ -281,7 +373,6 @@ long effectiveFront(long rawCm) {
   return (rawCm >= 0) ? rawCm : DIST_MAX_CM;
 }
 
-// Raw left from sweep; updates last-valid cache when fresh.
 long resolveLeftDistance(long rawLeftCm, bool *rawValidOut) {
   if (rawValidOut != NULL) {
     *rawValidOut = (rawLeftCm >= 0);
@@ -318,11 +409,12 @@ void emitWfDecide(long frontCm, long leftCm, bool leftRawValid,
 #endif
 
 // ---------------------------------------------------------------------------
-// Wall-following state machine
+// Wall-following state machine (continuous creep)
 // ---------------------------------------------------------------------------
 
-void wallFollowStep() {
-  fullSweep();
+void wallFollowCreepStep() {
+  fullSweepMoving();
+  emitSegmentMove();
 
   long frontRaw = lastFrontDistCm;
   long front = effectiveFront(frontRaw);
@@ -330,19 +422,18 @@ void wallFollowStep() {
   bool leftRawValid = false;
   long left = resolveLeftDistance(leftRaw, &leftRawValid);
 
-  // Phase 1 — acquisition: drive forward until a wall is ahead, then reorient
-  // so the wall sits on the left, then nudge forward to clear the corner.
   if (!wf_acquired) {
     if (frontRaw >= 0 && frontRaw <= WF_CORNER_THRESHOLD_CM) {
       turnLeft(WF_TURN90_MS);
-      driveForward(FORWARD_PULSE_MS);
+      creepForwardTimed(FORWARD_PULSE_MS);
       wf_acquired = true;
+      creepStraight();
       emitState("wf_acquired");
 #if DEBUG_WF
       emitWfDecide(frontRaw, leftRaw, leftRawValid, "acquired");
 #endif
     } else {
-      driveForward(FORWARD_PULSE_MS);
+      creepStraight();
 #if DEBUG_WF
       emitWfDecide(front, left, leftRawValid, "seek_wall");
 #endif
@@ -350,38 +441,32 @@ void wallFollowStep() {
     return;
   }
 
-  // Phase 2 — left-hand wall follow (one motion per scan). The left wall is
-  // sensed from the sweep (-45°/-75°); no scanning turns are needed.
   if (frontRaw >= 0 && frontRaw <= WF_CORNER_THRESHOLD_CM) {
-    // Inner corner: something ahead. Turn away from the left wall.
     emitState("wf_corner");
     turnLeft(WF_TURN90_MS);
+    creepStraight();
 #if DEBUG_WF
     emitWfDecide(frontRaw, left, leftRawValid, "inner");
 #endif
   } else if (leftRawValid && leftRaw > WF_OPEN_THRESHOLD_CM) {
-    // Outer corner: left wall ended. Overshoot, then wrap toward the wall.
-    driveForward(FORWARD_PULSE_MS);
+    creepForwardTimed(OUTER_OVERSHOOT_MS);
     turnRight(WF_TURN90_MS);
+    creepStraight();
 #if DEBUG_WF
     emitWfDecide(front, leftRaw, true, "outer");
 #endif
   } else if (left >= 0 && left > TARGET_WALL_CM + WALL_TOLERANCE_CM) {
-    // Drifting away from the left wall: nudge back toward it.
-    turnRight(TURN_PULSE_MS / 2);
-    driveForward(FORWARD_PULSE_MS);
+    creepArcTowardWall();
 #if DEBUG_WF
     emitWfDecide(front, left, leftRawValid, "nudge_to_wall");
 #endif
   } else if (left >= 0 && left < TARGET_WALL_CM - WALL_TOLERANCE_CM) {
-    // Too close to the left wall: nudge away from it.
-    turnLeft(TURN_PULSE_MS / 2);
-    driveForward(FORWARD_PULSE_MS);
+    creepArcAwayFromWall();
 #if DEBUG_WF
     emitWfDecide(front, left, leftRawValid, "nudge_off_wall");
 #endif
   } else {
-    driveForward(FORWARD_PULSE_MS);
+    creepStraight();
 #if DEBUG_WF
     emitWfDecide(front, left, leftRawValid, "straight");
 #endif
@@ -434,6 +519,8 @@ void setup() {
   scanServo.write(SERVO_CENTER);
 
   stopMotors();
+  currentAction = "";
+  segmentStartMs = millis();
   emitState("ready");
 }
 
@@ -441,7 +528,7 @@ void loop() {
   handleButton();
 
   if (currentMode == "WALLFOLLOW") {
-    wallFollowStep();
+    wallFollowCreepStep();
   } else {
     stopMotors();
   }

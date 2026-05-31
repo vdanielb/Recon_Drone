@@ -385,8 +385,9 @@ class WallFollowSimSource(TelemetrySource):
     """Simulate the WALLFOLLOW Arduino mode against an arbitrary polygon room.
 
     The virtual rover executes the same decision logic as ``wallFollowStep()``
-    on the MCU (right-hand rule).  Distances are computed by ray-casting
-    against the room's walls, so any polygon you pass in is supported.
+    on the MCU (left-hand rule — the wall is kept on the rover's left).
+    Distances are computed by ray-casting against the room's walls, so any
+    polygon you pass in is supported.
 
     Room shapes
     -----------
@@ -443,11 +444,12 @@ class WallFollowSimSource(TelemetrySource):
         world = self.theta + math.radians(angle_deg)
         return _ray_wall_distance(self.x, self.y, world, self.edges, self.rng)
 
-    def _right_wall_dist(self) -> float:
-        """Closest right-side wall reading (min of side + front-right).
+    def _left_wall_dist(self) -> float:
+        """Closest left-side wall reading (min of the two left beams).
 
-        Matches ``scanRightWall()`` on the MCU.  Using two angles prevents
-        false OPEN triggers at wall ends where one beam sees past the segment.
+        Matches ``leftWallFromSweep()`` on the MCU, which takes the minimum of
+        the -45 and -75 readings.  Using two angles prevents false OPEN
+        triggers at wall ends where the outer beam sees past the segment.
         """
         readings = []
         for ang in (-75, -45):
@@ -483,13 +485,14 @@ class WallFollowSimSource(TelemetrySource):
 
         for _ in range(self.steps):
             front_raw = self._dist(0)
-            right_raw  = self._right_wall_dist()
+            left_raw  = self._left_wall_dist()
 
             front = front_raw if front_raw >= 0 else 250.0
-            right  = right_raw  if right_raw  >= 0 else 250.0
+            left  = left_raw  if left_raw  >= 0 else 250.0
 
             # ----------------------------------------------------------
-            # Phase 1: acquisition – drive straight to find a wall.
+            # Phase 1: acquisition – drive straight to find a wall, then
+            # reorient so the wall sits on the rover's left.
             # ----------------------------------------------------------
             if not self._acquired:
                 if front <= self.WF_CORNER_THRESHOLD_CM:
@@ -508,15 +511,17 @@ class WallFollowSimSource(TelemetrySource):
                 continue
 
             # ----------------------------------------------------------
-            # Phase 2: wall-following.
+            # Phase 2: left-hand wall-following.
             # ----------------------------------------------------------
             if front <= self.WF_CORNER_THRESHOLD_CM:
+                # Inner corner: something ahead. Turn away from the left wall.
                 yield f"STATE,{self._t()},WALLFOLLOW,wf_corner"
                 self._apply_turn_left(self.WF_TURN90_MS)
                 yield (f"MOVE,{self._t()},TURN_LEFT,"
                        f"{self.WF_TURN90_MS},{self.TURN_SPEED}")
 
-            elif right > self.WF_OPEN_THRESHOLD_CM:
+            elif left > self.WF_OPEN_THRESHOLD_CM:
+                # Outer corner: left wall ended. Overshoot, then wrap toward it.
                 self._apply_forward(self.FORWARD_PULSE_MS)
                 yield (f"MOVE,{self._t()},FORWARD,"
                        f"{self.FORWARD_PULSE_MS},{self.BASE_SPEED}")
@@ -524,7 +529,8 @@ class WallFollowSimSource(TelemetrySource):
                 yield (f"MOVE,{self._t()},TURN_RIGHT,"
                        f"{self.WF_TURN90_MS},{self.TURN_SPEED}")
 
-            elif right > self.TARGET_WALL_CM + self.WALL_TOLERANCE_CM:
+            elif left > self.TARGET_WALL_CM + self.WALL_TOLERANCE_CM:
+                # Drifting away from the left wall: nudge back toward it.
                 self._apply_turn_right(self.TURN_PULSE_MS // 2)
                 yield (f"MOVE,{self._t()},TURN_RIGHT,"
                        f"{self.TURN_PULSE_MS // 2},{self.TURN_SPEED}")
@@ -532,7 +538,8 @@ class WallFollowSimSource(TelemetrySource):
                 yield (f"MOVE,{self._t()},FORWARD,"
                        f"{self.FORWARD_PULSE_MS},{self.BASE_SPEED}")
 
-            elif right < self.TARGET_WALL_CM - self.WALL_TOLERANCE_CM:
+            elif left < self.TARGET_WALL_CM - self.WALL_TOLERANCE_CM:
+                # Too close to the left wall: nudge away from it.
                 self._apply_turn_left(self.TURN_PULSE_MS // 2)
                 yield (f"MOVE,{self._t()},TURN_LEFT,"
                        f"{self.TURN_PULSE_MS // 2},{self.TURN_SPEED}")

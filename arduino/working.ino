@@ -1,3 +1,5 @@
+// last working sketch
+
 #include <Servo.h>
 
 // Elegoo V4 motor pins (TB6612 shield)
@@ -17,12 +19,11 @@
 // Wall-following tuning — calibrate on real hardware
 const int WF_TURN90_MS           = 500;
 const int TURN_PULSE_MS          = 100;
-const int FORWARD_PULSE_MS       = 500;
-const int TARGET_WALL_CM         = 50; // Desired gap to the left wall +- WALL_TOLERANCE_CM
-const int WALL_TOLERANCE_CM      = 25;
-const int WF_CORNER_THRESHOLD_CM = 50; // How close something in front can get before a left pivot (inner corner / acquisition)
-const int WF_OPEN_THRESHOLD_CM   = 75; // left distance that counts as "wall lost" → triggers an outer-corner turn right.
-// WF_OPEN_THRESHOLD_CM must stay above TARGET_WALL_CM + WALL_TOLERANCE_CM.
+const int FORWARD_PULSE_MS       = 300;
+const int TARGET_WALL_CM         = 45;
+const int WALL_TOLERANCE_CM      = 15;
+const int WF_CORNER_THRESHOLD_CM = 25;
+const int WF_OPEN_THRESHOLD_CM   = 50;
 const int BASE_SPEED             = 120;
 const int TURN_SPEED             = 120;
 

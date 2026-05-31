@@ -11,7 +11,7 @@ open space.
 
 WALLFOLLOW mode adds two extra labels:
   WF_CORNER    - wall detected ahead during wall-following
-  WF_WALL_NEAR - rover is within TARGET_WALL_CM of the right wall
+  WF_WALL_NEAR - rover is within TARGET_WALL_CM of the left wall
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ def classify(scan: Sequence[Tuple[int, float]], mode: str = "") -> str:
 
     When *mode* is ``"WALLFOLLOW"`` two additional labels are possible:
     ``WF_CORNER`` (wall ahead during wall-following) and ``WF_WALL_NEAR``
-    (right wall inside the follow band).
+    (left wall inside the follow band).
     """
     if not scan:
         return "UNKNOWN"
@@ -61,7 +61,7 @@ def classify(scan: Sequence[Tuple[int, float]], mode: str = "") -> str:
     if mode.upper() == "WALLFOLLOW":
         if front_blocked:
             return "WF_CORNER"
-        if right_blocked:
+        if left_blocked:
             return "WF_WALL_NEAR"
 
     if front_blocked and left_blocked and right_blocked:
