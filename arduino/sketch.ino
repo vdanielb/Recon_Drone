@@ -22,22 +22,33 @@
 const int WF_TURN90_MS           = 500;
 const int TURN_PULSE_MS          = 100;
 const int FORWARD_PULSE_MS       = 300;
-const int TARGET_WALL_CM         = 30; // Desired gap to the left wall +- WALL_TOLERANCE_CM
+const int TARGET_WALL_CM         = 45; // Desired gap to the left wall +- WALL_TOLERANCE_CM
 const int WALL_TOLERANCE_CM      = 15;
-const int WF_CORNER_THRESHOLD_CM = 15; // How close something in front can get before a left pivot (inner corner / acquisition)
-const int WF_OPEN_THRESHOLD_CM   = 45; // left distance that counts as "wall lost" → triggers an outer-corner turn right.
+const int WF_CORNER_THRESHOLD_CM = 30; // How close something in front can get before a left pivot (inner corner / acquisition)
+const int WF_OPEN_THRESHOLD_CM   = 60; // left distance that counts as "wall lost" → triggers an outer-corner turn right.
 // WF_OPEN_THRESHOLD_CM must stay above TARGET_WALL_CM + WALL_TOLERANCE_CM.
 const int BASE_SPEED             = 120;
-const int TURN_SPEED             = 120;
+const int TURN_SPEED             = 100;
+
+// Gyro-based wall alignment — square the rover up to the left wall using two
+// rear-left sweep beams. Requires the IMU (exact closed-loop turn). The side
+// beam points straight at the wall; the forward beam is rotated ALIGN_PHI_DEG
+// toward the front. Both MUST exist in SCAN_ANGLES.
+const int   ALIGN_BEAM_SIDE_DEG    = -90;   // straight at the left wall
+const int   ALIGN_BEAM_FWD_DEG     = -60;   // rotated ALIGN_PHI_DEG toward front
+const float ALIGN_PHI_DEG          = 30.0f; // = |SIDE - FWD|
+const float ALIGN_DEADBAND_DEG     = 3.0f;  // ignore sub-noise misalignment
+const float ALIGN_MAX_DEG          = 20.0f; // clamp per-step correction
+const long  ALIGN_MAX_PLANE_GAP_CM = 40;    // reject when beams aren't one flat wall
 
 // MPU6050 gyro (I2C: SDA=A4, SCL=A5) — exact turns + heading telemetry
 #define MPU_ADDR                 0x68
 const float GYRO_SENS              = 131.0f;  // LSB/(deg/s) at +/-250 deg/s
 const int GYRO_SIGN                = 1;       // flip to -1 if left turn reads negative
 const int WF_TURN_ANGLE_DEG        = 90;
-const int NUDGE_ANGLE_DEG          = 12;
+const int NUDGE_ANGLE_DEG          = 8;
 // Cut motors this many degrees early so coast/momentum lands near target.
-const float TURN_LEAD_DEG          = 10.0f;
+const float TURN_LEAD_DEG          = 0.0f;
 const unsigned long TURN_TIMEOUT_MS = 3000UL;
 const int GYRO_BIAS_SAMPLES        = 1000;
 
@@ -57,8 +68,11 @@ const unsigned long DEBOUNCE_MS = 40;
 const unsigned long LEFT_CACHE_MS = 500;
 
 // Sweep angles (telemetry degrees: 0 = forward, negative = left, positive = right)
-const int SCAN_ANGLES[] = {-75, -45, -20, 0, 20, 45, 75};
-const int SCAN_COUNT = 7;
+// Denser sweep is worthwhile with the VL53L4CD ToF (narrow FoV, mm accuracy) —
+// each beam is a clean, distinct measurement, unlike the old wide ultrasonic cone.
+// -45 and -75 MUST remain present: leftWallFromSweep() keys off them.
+const int SCAN_ANGLES[] = {-90, -75, -60, -45, -30, -15, 0, 15, 30, 45, 60, 75, 90};
+const int SCAN_COUNT = (int)(sizeof(SCAN_ANGLES) / sizeof(SCAN_ANGLES[0]));
 
 Servo scanServo;
 ModulinoDistance tofSensor;
@@ -244,16 +258,18 @@ void stopMotors() {
   analogWrite(PWMB, 0);
 }
 
+// Pin mapping verified on hardware: AIN1 HIGH / BIN1 LOW spins the chassis
+// physically LEFT (CCW); AIN1 LOW / BIN1 HIGH spins it physically RIGHT (CW).
 void setLeftSpin() {
-  digitalWrite(AIN1, LOW);
-  digitalWrite(BIN1, HIGH);
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(BIN1, LOW);
   analogWrite(PWMA, TURN_SPEED);
   analogWrite(PWMB, TURN_SPEED);
 }
 
 void setRightSpin() {
-  digitalWrite(AIN1, HIGH);
-  digitalWrite(BIN1, LOW);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(BIN1, HIGH);
   analogWrite(PWMA, TURN_SPEED);
   analogWrite(PWMB, TURN_SPEED);
 }
@@ -282,13 +298,16 @@ void driveForward(int durationMs) {
   }
 }
 
+// Sign convention on this chassis wiring: positive deltaDeg = physical RIGHT
+// (CW), negative = physical LEFT (CCW). The wall-follow branch signs depend on
+// this; do not flip without flipping them too.
 void turnByAngle(float deltaDeg) {
   if (!imuOk) {
     int ms = fallbackTurnMs(deltaDeg);
     if (deltaDeg >= 0.0f) {
-      turnLeft(ms);
-    } else {
       turnRight(ms);
+    } else {
+      turnLeft(ms);
     }
     return;
   }
@@ -300,9 +319,9 @@ void turnByAngle(float deltaDeg) {
     target = 0.0f;
   }
   if (deltaDeg >= 0.0f) {
-    setLeftSpin();
-  } else {
     setRightSpin();
+  } else {
+    setLeftSpin();
   }
 
   unsigned long t0 = millis();
@@ -313,16 +332,41 @@ void turnByAngle(float deltaDeg) {
 
   unsigned long elapsed = millis() - t0;
   if (deltaDeg >= 0.0f) {
-    emitMove("TURN_LEFT", (int)elapsed, TURN_SPEED);
-  } else {
     emitMove("TURN_RIGHT", (int)elapsed, TURN_SPEED);
+  } else {
+    emitMove("TURN_LEFT", (int)elapsed, TURN_SPEED);
   }
   emitHeading();
 }
 
+// Closed-loop in-place turn for small, precise alignment corrections. Unlike
+// turnByAngle(), it applies no lead-angle cutoff, so sub-TURN_LEAD_DEG turns
+// still execute (turnByAngle zeroes its target below TURN_LEAD_DEG). IMU only.
+void alignTurn(float deltaDeg) {
+  if (!imuOk) {
+    return;
+  }
+  float startYaw = yawDeg;
+  float target = fabs(deltaDeg);
+  // Same sign convention as turnByAngle: positive = physical RIGHT.
+  if (deltaDeg >= 0.0f) {
+    setRightSpin();
+  } else {
+    setLeftSpin();
+  }
+  unsigned long t0 = millis();
+  while (fabs(yawDeg - startYaw) < target && millis() - t0 < TURN_TIMEOUT_MS) {
+    updateYaw();
+  }
+  stopMotors();
+  unsigned long elapsed = millis() - t0;
+  emitMove(deltaDeg >= 0.0f ? "TURN_RIGHT" : "TURN_LEFT", (int)elapsed, TURN_SPEED);
+  emitHeading();
+}
+
 void turnLeft(int durationMs) {
-  digitalWrite(AIN1, LOW);
-  digitalWrite(BIN1, HIGH);
+  digitalWrite(AIN1, HIGH);
+  digitalWrite(BIN1, LOW);
   analogWrite(PWMA, TURN_SPEED);
   analogWrite(PWMB, TURN_SPEED);
   delay(durationMs);
@@ -331,8 +375,8 @@ void turnLeft(int durationMs) {
 }
 
 void turnRight(int durationMs) {
-  digitalWrite(AIN1, HIGH);
-  digitalWrite(BIN1, LOW);
+  digitalWrite(AIN1, LOW);
+  digitalWrite(BIN1, HIGH);
   analogWrite(PWMA, TURN_SPEED);
   analogWrite(PWMB, TURN_SPEED);
   delay(durationMs);
@@ -429,6 +473,37 @@ long leftWallFromSweep() {
   return combineSideWall(d45, d75);
 }
 
+// Cached sweep distance for an exact telemetry angle, or -1 if not in the sweep
+// / no valid reading.
+long sweepDistAtAngle(int telemetryDeg) {
+  for (int i = 0; i < SCAN_COUNT; i++) {
+    if (SCAN_ANGLES[i] == telemetryDeg) {
+      return lastSweepDistCm[i];
+    }
+  }
+  return -1;
+}
+
+// Heading error relative to the left wall, in degrees, from two rear-left beams.
+// 0 = parallel; positive = wall recedes ahead (nose angled away from wall). The
+// correction is a physical LEFT turn, i.e. alignTurn(-beta) under the chassis
+// convention (positive = right). Returns NAN when the beams don't describe a
+// single flat wall (e.g. straddling a corner) so the caller can skip correcting.
+float wallMisalignDeg() {
+  long b = sweepDistAtAngle(ALIGN_BEAM_SIDE_DEG);  // straight to side (-90)
+  long a = sweepDistAtAngle(ALIGN_BEAM_FWD_DEG);   // angled forward (-60)
+  if (a < 0 || b < 0) {
+    return NAN;
+  }
+  float phi = radians(ALIGN_PHI_DEG);
+  float dy = (float)a * cos(phi) - (float)b;       // = 0 when parallel
+  // Flat-wall sanity: a large residual means the beams hit different surfaces.
+  if (fabs(dy) > (float)ALIGN_MAX_PLANE_GAP_CM) {
+    return NAN;
+  }
+  return degrees(atan2((float)dy, (float)a * sin(phi)));
+}
+
 long effectiveFront(long rawCm) {
   return (rawCm >= 0) ? rawCm : DIST_MAX_CM;
 }
@@ -508,12 +583,17 @@ void wallFollowStep() {
 #if DEBUG_WF
     emitWfDecide(frontRaw, left, leftRawValid, "inner");
 #endif
-  } else if (leftRawValid && leftRaw > WF_OPEN_THRESHOLD_CM) {
-    // Outer corner: left wall ended. Overshoot, then wrap toward the wall.
+  } else if (left < 0 || (leftRawValid && leftRaw > WF_OPEN_THRESHOLD_CM)) {
+    // Outer corner: the left wall ended. The front is open here (an inner
+    // corner is handled above), so the wall is genuinely lost. This shows up
+    // two ways: as a valid-but-large gap (> WF_OPEN_THRESHOLD_CM), or — far more
+    // commonly — as an out-of-range/invalid reading once the stale-cache window
+    // has expired (resolveLeftDistance() then returns left < 0). Treat both as
+    // "wall lost": overshoot to clear the corner, then wrap toward the wall.
     driveForward(FORWARD_PULSE_MS);
     turnByAngle((float)(-WF_TURN_ANGLE_DEG));
 #if DEBUG_WF
-    emitWfDecide(front, leftRaw, true, "outer");
+    emitWfDecide(front, left, leftRawValid, "outer");
 #endif
   } else if (left >= 0 && left > TARGET_WALL_CM + WALL_TOLERANCE_CM) {
     // Drifting away from the left wall: nudge back toward it.
@@ -530,6 +610,22 @@ void wallFollowStep() {
     emitWfDecide(front, left, leftRawValid, "nudge_off_wall");
 #endif
   } else {
+    // On track (gap within tolerance): square up to the wall before stepping.
+    // Uses two rear-left beams + gyro for an exact heading correction, turning
+    // the bang-bang follower into a parallel-seeking one. IMU-gated.
+    //
+    // Sign: wallMisalignDeg() returns beta > 0 when the wall recedes ahead
+    // (nose drifted away from the left wall) — the fix is a physical LEFT turn
+    // toward the wall. On this chassis a physical left turn is a NEGATIVE
+    // angle (turnByAngle(-90) is the observed left/outer-corner turn), so we
+    // pass -beta.
+    if (imuOk) {
+      float beta = wallMisalignDeg();
+      if (!isnan(beta) && fabs(beta) > ALIGN_DEADBAND_DEG) {
+        alignTurn(-constrain(beta, -ALIGN_MAX_DEG, ALIGN_MAX_DEG));
+        emitState("wf_align");
+      }
+    }
     driveForward(FORWARD_PULSE_MS);
 #if DEBUG_WF
     emitWfDecide(front, left, leftRawValid, "straight");
